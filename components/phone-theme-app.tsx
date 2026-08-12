@@ -45,6 +45,7 @@ import {
   saveThemeAssetFromBlob,
   deleteThemeAsset,
   getThemeAssetMap,
+  describeAssetSaveError,
 } from "@/lib/theme-storage";
 import { BINDING_ACCENTS } from "@/lib/ui-accent-colors";
 import { ConfirmDialog, ContentDialog } from "@/components/ui/modal";
@@ -253,7 +254,7 @@ export function PhoneThemeApp({
       await onApply(result.themeProfile);
       onDraftChange(result.themeProfile);
       setConfirmThemeReset(false);
-      onNotice("已恢复默认外观，壁纸库和自定义组件已保留。");
+      onNotice("已恢复默认外观，壁纸库、自定义组件和自定义 App 已保留。");
     } catch (error) {
       console.error(error);
       onNotice(error instanceof Error ? error.message : "恢复默认失败");
@@ -492,7 +493,7 @@ export function PhoneThemeApp({
       {confirmThemeReset && (
         <ConfirmDialog
           title="恢复默认外观？"
-          message="将恢复默认主题色、当前壁纸、图标、桌面组件和桌面位置；已导入的壁纸库和自定义组件会保留，但不会继续应用在桌面上。"
+          message="将恢复默认主题色、当前壁纸、图标、桌面组件和桌面位置；已导入的壁纸库和自定义组件会保留，但不会继续应用在桌面上。已安装的自定义 App 图标会自动排回桌面空位。"
           icon={AlertCircle}
           variant="danger"
           confirmLabel={themeTransferBusy ? "恢复中" : "恢复默认"}
@@ -1055,8 +1056,8 @@ function IconSkinPage({
         (Object.values(resolveActiveIconSkins(next)).filter(Boolean) as string[])
       );
       setThumbs(map);
-    } catch {
-      onNotice("上传失败，请重试");
+    } catch (error) {
+      onNotice(describeAssetSaveError(error));
     }
     setUploadTarget(null);
   }, [draft, uploadTarget, onDraftChange, onApply, onNotice]);
@@ -1092,8 +1093,8 @@ function IconSkinPage({
       await onApply(next);
       const map = await getThemeAssetMap([assetId]);
       setDockThumbUrl(map[assetId] ?? null);
-    } catch {
-      onNotice("上传失败，请重试");
+    } catch (error) {
+      onNotice(describeAssetSaveError(error));
     }
   }, [draft, onDraftChange, onApply, onNotice]);
 
@@ -1317,8 +1318,8 @@ function WallpaperPage({
       // Reload thumbnails for the new asset
       const map = await getThemeAssetMap(next.wallpaperLibrary);
       setThumbs(map);
-    } catch {
-      onNotice("\u4E0A\u4F20\u5931\u8D25\uFF0C\u8BF7\u91CD\u8BD5");
+    } catch (error) {
+      onNotice(describeAssetSaveError(error));
     }
   }, [draft, onDraftChange, onApply, onNotice]);
 

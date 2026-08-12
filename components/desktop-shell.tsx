@@ -17,6 +17,9 @@ import MusicPlayer from "@/components/music/music-player";
 import MusicFloat from "@/components/music/music-float";
 import MiniAppWindow from "@/components/music/mini-app-window";
 import { PhoneCalendarApp } from "@/components/calendar-app";
+import { PhoneQaApp } from "@/components/phone-qa-app";
+import { ResourceHubApp } from "@/components/resource-hub/resource-hub-app";
+import "@/lib/qa-error-log";
 import { DiaryApp } from "@/components/diary/diary-app";
 import { XiaohongshuApp } from "@/components/xiaohongshu/xiaohongshu-app";
 import { StoryApp } from "@/components/story/story-app";
@@ -60,7 +63,10 @@ import {
 } from "@/lib/custom-app-tool-runtime";
 import {
   CUSTOM_APPS_UPDATED_EVENT,
+  CUSTOM_APP_PLACE_DESKTOP_EVENT,
+  loadCustomAppIconStyles,
   loadInstalledCustomApps,
+  type CustomAppIconStyle,
 } from "@/lib/custom-app-storage";
 import {
   isCustomAppMarketItemNewerThanInstalled,
@@ -81,6 +87,7 @@ import {
   readThemeProfile,
   writeThemeProfile
 } from "@/lib/theme-storage";
+import { THEME_PACKAGE_INSTALLED_EVENT } from "@/lib/theme-package";
 import {
   DEFAULT_THEME_PROFILE,
   DEFAULT_FONT_FAMILY,
@@ -116,6 +123,7 @@ import { parseAIResponse } from "@/lib/rich-message-parser";
 import { requestBackgroundChatReply, scheduleFollowUp } from "@/lib/follow-up-service";
 import { CHAT_MESSAGE_NOTICE_EVENT, CHAT_OPEN_SESSION_EVENT, type ChatMessageNoticeDetail } from "@/lib/chat-notification-events";
 import { setMascotContext } from "@/lib/mascot-context";
+import { DESKTOP_WIDGETS_CHANGED_EVENT } from "@/lib/mascot-events";
 import { useWeixinBridge } from "@/lib/use-weixin-bridge";
 import { startWeixinCloudRealtimeSync } from "@/lib/weixin-cloud-sync";
 import { sendBrowserNotification } from "@/lib/browser-notification";
@@ -666,12 +674,14 @@ function pointerToGridCell(
   const colWidth = colWidths[0] || 66;
   const colGap = parseFloat(computed.columnGap) || 20;
   const rowGap = parseFloat(computed.rowGap) || 0;
+  /* rect 高度是 border-box（含 padding），网格行轨道只占内容盒。 */
+  const padY = (parseFloat(computed.paddingTop) || 0) + (parseFloat(computed.paddingBottom) || 0);
   const contentWidth = colWidths.length * colWidth + (colWidths.length - 1) * colGap;
   const originX = rect.left + (rect.width - contentWidth) / 2;
-  const originY = rect.top;
+  const originY = rect.top + (parseFloat(computed.paddingTop) || 0);
   const colStep = colWidth + colGap;
   const totalRowGap = (GRID_ROWS - 1) * rowGap;
-  const rowHeight = (rect.height - totalRowGap) / GRID_ROWS;
+  const rowHeight = (rect.height - padY - totalRowGap) / GRID_ROWS;
   const rowStep = rowHeight + rowGap;
   const col = Math.floor((px - originX) / colStep);
   const row = Math.floor((py - originY) / rowStep);
@@ -949,6 +959,14 @@ export function DesktopShell({ initialThemeProfile, initialThemeAssets }: Deskto
   const [notice, setNotice] = useState<string | null>(null);
   const [activeApp, setActiveApp] = useState<DesktopIconId | null>(null);
   const [customApps, setCustomApps] = useState<InstalledCustomApp[]>([]);
+  // 自定义 APP 桌面图标样式偏好（global = 忽略上传图标走全局效果）
+  const [customAppIconStyles, setCustomAppIconStyles] = useState<Record<string, CustomAppIconStyle>>({});
+  useEffect(() => {
+    const syncIconStyles = () => setCustomAppIconStyles(loadCustomAppIconStyles());
+    syncIconStyles();
+    window.addEventListener(CUSTOM_APPS_UPDATED_EVENT, syncIconStyles);
+    return () => window.removeEventListener(CUSTOM_APPS_UPDATED_EVENT, syncIconStyles);
+  }, []);
   const [customAppUpdatePrompt, setCustomAppUpdatePrompt] = useState<PendingCustomAppUpdatePrompt | null>(null);
   const [customAppUpdateBusy, setCustomAppUpdateBusy] = useState(false);
   const customAppUpdateCheckingRef = useRef<Set<string>>(new Set());
@@ -1386,6 +1404,36 @@ export function DesktopShell({ initialThemeProfile, initialThemeAssets }: Deskto
     };
     window.addEventListener(CUSTOM_APPS_UPDATED_EVENT, refreshCustomApps);
     return () => window.removeEventListener(CUSTOM_APPS_UPDATED_EVENT, refreshCustomApps);
+  }, []);
+
+  // 其他模块（如工坊 agent 装应用）请求把已安装应用的图标摆上桌面
+  const handleInstallCustomAppToDesktopRef = useRef<((app: InstalledCustomApp) => void) | null>(null);
+  const handleThemeDesktopChangeRef = useRef<((next: { widgets: WidgetInstance[]; iconLayout: DesktopLayout; dock?: DesktopIconId[] }) => void) | null>(null);
+  const applyThemeRef = useRef<((next: ThemeProfile) => Promise<void>) | null>(null);
+  useEffect(() => {
+    const placeHandler = (e: Event) => {
+      const appId = (e as CustomEvent).detail?.appId;
+      if (typeof appId !== "string" || !appId) return;
+      const app = loadInstalledCustomApps().find(item => item.id === appId);
+      if (app) handleInstallCustomAppToDesktopRef.current?.(app);
+    };
+    window.addEventListener(CUSTOM_APP_PLACE_DESKTOP_EVENT, placeHandler);
+    return () => window.removeEventListener(CUSTOM_APP_PLACE_DESKTOP_EVENT, placeHandler);
+  }, []);
+
+  // 资源集市在 lib 里装完主题包后请桌面刷新。走的落地路径与外观页导入完全一致
+  // （handleThemeDesktopChange + applyTheme），只是入口从 React 回调换成了事件。
+  useEffect(() => {
+    const onThemePackage = (e: Event) => {
+      const detail = (e as CustomEvent).detail as
+        | { themeProfile?: ThemeProfile; iconLayout?: DesktopLayout; widgets?: WidgetInstance[]; dock?: DesktopIconId[] }
+        | undefined;
+      if (!detail?.themeProfile || !detail.iconLayout || !detail.widgets) return;
+      handleThemeDesktopChangeRef.current?.({ widgets: detail.widgets, iconLayout: detail.iconLayout, dock: detail.dock });
+      void applyThemeRef.current?.(detail.themeProfile);
+    };
+    window.addEventListener(THEME_PACKAGE_INSTALLED_EVENT, onThemePackage);
+    return () => window.removeEventListener(THEME_PACKAGE_INSTALLED_EVENT, onThemePackage);
   }, []);
 
   useEffect(() => {
@@ -2027,6 +2075,7 @@ html,body{margin:0;padding:0;width:100%;height:100%;background:#121110;color:rgb
       window.setTimeout(() => setCurrentPageIndex(Math.max(0, (placedPageNumber ?? 1) - 1)), 0);
     }
   }, []);
+  handleInstallCustomAppToDesktopRef.current = handleInstallCustomAppToDesktop;
 
   // Allow other components to switch apps via custom event
   const [chatInitSessionId, setChatInitSessionId] = useState<string | null>(null);
@@ -2279,7 +2328,9 @@ html,body{margin:0;padding:0;width:100%;height:100%;background:#121110;color:rgb
         const colW = parseFloat(cs.gridTemplateColumns.split(/\s+/)[0] || "66");
         const colGap = parseFloat(cs.columnGap) || 20;
         const rowGap = parseFloat(cs.rowGap) || 0;
-        const rowH = (gridEl.getBoundingClientRect().height - (GRID_ROWS - 1) * rowGap) / GRID_ROWS;
+        /* rect 高度是 border-box（含 padding），网格行轨道只占内容盒。 */
+        const padY = (parseFloat(cs.paddingTop) || 0) + (parseFloat(cs.paddingBottom) || 0);
+        const rowH = (gridEl.getBoundingClientRect().height - padY - (GRID_ROWS - 1) * rowGap) / GRID_ROWS;
         grabCellCol = Math.floor((clientX - rect.left) / (colW + colGap));
         grabCellRow = Math.floor((clientY - rect.top) / (rowH + rowGap));
       }
@@ -2852,6 +2903,9 @@ html,body{margin:0;padding:0;width:100%;height:100%;background:#121110;color:rgb
     kvSet(ICON_LAYOUT_STORAGE_KEY, JSON.stringify(normalizedLayout));
   }
 
+  handleThemeDesktopChangeRef.current = handleThemeDesktopChange;
+  applyThemeRef.current = applyTheme;
+
   function handleWidgetConfigChange(widgetId: string, config: Record<string, unknown>): void {
     setWidgets((prev) => {
       const next = prev.map((w) =>
@@ -2861,6 +2915,44 @@ html,body{margin:0;padding:0;width:100%;height:100%;background:#121110;color:rgb
       return next;
     });
   }
+
+  // 小卷（内置助手）写入组件/DIY 模板后通知桌面重新水合，实现实时热更新。
+  // 拖拽进行中不能换底层数组（会打断 FLIP 和落点计算），先挂起，退出编辑模式后补一次。
+  const mascotWidgetsDirtyRef = useRef(false);
+  useEffect(() => {
+    const reload = () => {
+      if (editDragRef.current?.active || editDragRef.current?.pending) {
+        mascotWidgetsDirtyRef.current = true;
+        return;
+      }
+      setWidgets(loadWidgets());
+    };
+    window.addEventListener(DESKTOP_WIDGETS_CHANGED_EVENT, reload);
+    return () => window.removeEventListener(DESKTOP_WIDGETS_CHANGED_EVENT, reload);
+  }, []);
+  useEffect(() => {
+    if (!editMode && mascotWidgetsDirtyRef.current) {
+      mascotWidgetsDirtyRef.current = false;
+      setWidgets(loadWidgets());
+    }
+  }, [editMode]);
+
+  // DIY code 组件的长按发生在沙箱 iframe 里，宿主收不到指针事件；
+  // 桥接脚本检测到长按后 postMessage，这里代为进入编辑态。
+  // 进入编辑态后 iframe 会放弃指针事件（CSS），后续拖拽走宿主正常链路。
+  useEffect(() => {
+    function handleDiyLongPress(event: MessageEvent) {
+      const data = event.data as { source?: unknown; type?: unknown; widgetId?: unknown } | null;
+      if (!data || typeof data !== "object") return;
+      if (data.source !== "ai-phone-diy-widget" || data.type !== "longPress") return;
+      if (typeof data.widgetId !== "string") return;
+      if (!widgetsRef.current.some((w) => w.id === data.widgetId)) return;
+      setEditMode(true);
+      try { navigator.vibrate?.(30); } catch { /* ignore */ }
+    }
+    window.addEventListener("message", handleDiyLongPress);
+    return () => window.removeEventListener("message", handleDiyLongPress);
+  }, []);
 
   // Build a map of icon skins (icon ID -> data URL) for the theme app preview
   const iconSkinUrls = useMemo(() => {
@@ -2912,7 +3004,13 @@ html,body{margin:0;padding:0;width:100%;height:100%;background:#121110;color:rgb
 
       const computed = window.getComputedStyle(gridEl);
       const rowGap = Number.parseFloat(computed.rowGap || "0");
-      const gridHeight = gridEl.getBoundingClientRect().height;
+      /* rect 高度是 border-box（含 padding），网格行轨道只占内容盒；
+         padding-bottom（--home-grid-bottom-trim）不减掉会让 --slot-row-step
+         虚高 padding/6，跨行组件随之比图标行低。 */
+      const padY =
+        (Number.parseFloat(computed.paddingTop || "0") || 0) +
+        (Number.parseFloat(computed.paddingBottom || "0") || 0);
+      const gridHeight = gridEl.getBoundingClientRect().height - padY;
       const rowHeight = (gridHeight - (GRID_ROWS - 1) * rowGap) / GRID_ROWS;
       const nextRowStep = rowHeight + rowGap;
       if (nextRowStep <= 0) {
@@ -3305,6 +3403,12 @@ html,body{margin:0;padding:0;width:100%;height:100%;background:#121110;color:rgb
 
     if (activeApp === "calendar") {
       return <PhoneCalendarApp onClose={() => setActiveApp(null)} onNotice={setNotice} />;
+    }
+    if (activeApp === "qa") {
+      return <PhoneQaApp onClose={() => setActiveApp(null)} onNotice={setNotice} />;
+    }
+    if (activeApp === "resource_hub") {
+      return <ResourceHubApp onClose={() => setActiveApp(null)} onNotice={setNotice} />;
     }
 
     if (activeApp === "diary") {
@@ -3838,7 +3942,9 @@ html,body{margin:0;padding:0;width:100%;height:100%;background:#121110;color:rgb
                               const builtinIconId = customApp ? null : icon.id as IconId;
                               const iconSkinId = activeIconSkins[iconId];
                               const iconSkinUrl = iconSkinId ? themeAssets[iconSkinId] ?? null : null;
-                              const customIconUrl = customApp?.iconDataUrl ?? null;
+                              const customIconUrl = customApp && customAppIconStyles[customApp.id] !== "global"
+                                ? customApp.iconDataUrl ?? null
+                                : null;
                               const iconImageUrl = iconSkinUrl || customIconUrl;
                               const hasImageIcon = Boolean(iconImageUrl);
                               const isDragging = dragItem?.type === "icon" && dragItem.id === iconId;
@@ -3976,7 +4082,9 @@ html,body{margin:0;padding:0;width:100%;height:100%;background:#121110;color:rgb
                     const builtinIconId = customApp ? null : (icon.id as IconId);
                     const iconSkinId = activeIconSkins[iconId];
                     const iconSkinUrl = iconSkinId ? themeAssets[iconSkinId] ?? null : null;
-                    const customIconUrl = customApp?.iconDataUrl ?? null;
+                    const customIconUrl = customApp && customAppIconStyles[customApp.id] !== "global"
+                      ? customApp.iconDataUrl ?? null
+                      : null;
                     const iconImageUrl = iconSkinUrl || customIconUrl;
                     const hasImageIcon = Boolean(iconImageUrl);
                     const isDragging = dragItem?.type === "icon" && dragItem.id === iconId;

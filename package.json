@@ -5,15 +5,17 @@
   "license": "AGPL-3.0-only",
   "scripts": {
     "dev": "node --max-old-space-size=4096 scripts/local-next-server.mjs --dev",
-    "build": "next build && node scripts/restore-backdrop-filter.mjs",
+    "build": "node scripts/build-weixin-assistant-dist.mjs && next build && node scripts/restore-backdrop-filter.mjs",
     "start": "node scripts/local-next-server.mjs --prod",
     "lint": "next lint",
     "check:sdk": "node scripts/check-custom-app-sdk-consistency.mjs",
     "weixin:assistant": "node tools/weixin-local-assistant/assistant.mjs",
-    "weixin:assistant:once": "node tools/weixin-local-assistant/assistant.mjs --once"
+    "weixin:assistant:once": "node tools/weixin-local-assistant/assistant.mjs --once",
+    "weixin:build-dist": "node scripts/build-weixin-assistant-dist.mjs"
   },
   "dependencies": {
     "@gltf-transform/functions": "^4.4.1",
+    "@heroicons/react": "^2.2.0",
     "@mdi/js": "^7.4.47",
     "@phosphor-icons/react": "^2.1.10",
     "@react-three/drei": "^10.7.7",

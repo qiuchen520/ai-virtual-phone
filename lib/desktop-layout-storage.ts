@@ -101,16 +101,17 @@ export function createDefaultDesktopIconLayout(_widgets: WidgetInstance[] = []):
       row: 5 + Math.floor(i / GRID_COLS),
       col: (i % GRID_COLS) + 1,
     })),
+    // 第二页：第 4 行留给 iOS 操作菜单组件，图标从第 5 行开始
     page2: PAGE_2_DEFAULT.map((id, i) => ({
       id,
-      row: 4 + Math.floor(i / GRID_COLS),
+      row: 5 + Math.floor(i / GRID_COLS),
       col: (i % GRID_COLS) + 1,
     })),
-    // 第三页：水平居中排在中间那行（第 3 行）。单个图标居中于 col2，两个则 col2、col3。
+    // 第三页：右半边 2×2（第 4~5 行、第 3~4 列），左半边留给日历组件
     page3: PAGE_3_DEFAULT.map((id, i) => ({
       id,
-      row: 3,
-      col: Math.floor((GRID_COLS - PAGE_3_DEFAULT.length) / 2) + 1 + i,
+      row: 4 + Math.floor(i / 2),
+      col: 3 + (i % 2),
     })),
   } as DesktopIconLayout;
 }
@@ -178,6 +179,54 @@ export function writeDesktopIconLayout(layout: DesktopIconLayout): DesktopIconLa
   const normalized = normalizeDesktopIconLayout(layout);
   kvSet(ICON_LAYOUT_STORAGE_KEY, JSON.stringify(normalized));
   return normalized;
+}
+
+/**
+ * 把已安装但没出现在布局或 dock 里的自定义 app 图标补回桌面空位。
+ * 恢复默认外观、导入主题包时图标布局会被整体覆盖，若不补回，
+ * 已安装的自定义 app 会从桌面上消失（app 本体仍在，只是没有图标可点）。
+ */
+export function appendMissingCustomAppIcons(
+  layout: DesktopIconLayout,
+  widgets: WidgetInstance[] = [],
+  dock: DesktopIconId[] = []
+): DesktopIconLayout {
+  const present = new Set<string>(dock);
+  for (const icon of getDesktopIconLayoutItems(layout)) {
+    present.add(icon.id);
+  }
+  const missing = Array.from(getInstalledCustomIconIds()).filter((id) => !present.has(id)) as DesktopIconId[];
+  if (missing.length === 0) {
+    return layout;
+  }
+
+  const next = { ...layout } as DesktopIconLayout;
+  let index = 0;
+  // 页面满（含组件占位）就顺延到下一页；上限只是防御性兜底，不会实际触达。
+  for (let page = 1; index < missing.length && page <= 50; page++) {
+    const pageKey = getDesktopPageKey(page);
+    const icons = next[pageKey] ?? [];
+    const occupied = buildWidgetOccupancy(widgets, page);
+    for (const icon of icons) {
+      if (icon.row >= 1 && icon.row <= GRID_ROWS && icon.col >= 1 && icon.col <= GRID_COLS) {
+        occupied[icon.row - 1][icon.col - 1] = true;
+      }
+    }
+    const placed: IconPosition[] = [];
+    for (let row = 0; row < GRID_ROWS && index < missing.length; row++) {
+      for (let col = 0; col < GRID_COLS && index < missing.length; col++) {
+        if (occupied[row][col]) {
+          continue;
+        }
+        placed.push({ id: missing[index], row: row + 1, col: col + 1 });
+        index++;
+      }
+    }
+    if (placed.length > 0) {
+      next[pageKey] = [...icons, ...placed];
+    }
+  }
+  return next;
 }
 
 // ── Dock layout ───────────────────────────────────────
