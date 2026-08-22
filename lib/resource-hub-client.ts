@@ -20,10 +20,9 @@ import {
     loadRegexes, saveRegexes, parseRegexFromJson,
 } from "./settings-storage";
 import { saveScheme } from "./css-scheme-storage";
+import { STATUS_REGION_SCHEME_TARGET } from "./chat-status-region";
 import { createOrGetSession, loadChatSessions, saveChatSessions } from "./chat-storage";
 import { readThemeProfile, writeThemeProfile } from "./theme-storage";
-import { loadGameDrafts, saveGameDrafts } from "./game-storage";
-import type { GameTemplateDraft } from "./game-types";
 import type { Prompt } from "./settings-types";
 
 const SOURCE_KEY = "ai_phone_resource_hub_source_v1";
@@ -68,6 +67,16 @@ function effectiveRef(source: ResourceHubSource): string {
     return _resolvedRef?.key === sourceKey(source) ? _resolvedRef.sha : source.branch;
 }
 
+// 中转站 endpoint（与上传/送花同一个;不能 import resource-hub-upload,会循环依赖,直接读同一份配置）
+const RELAY_ENDPOINT_FALLBACK = "https://floatshare.netlify.app/.netlify/functions/upload";
+function relayEndpoint(): string {
+    try {
+        const parsed = JSON.parse(kvGet("ai_phone_resource_hub_upload_cfg_v1") || "{}") as { endpoint?: string };
+        if (parsed && typeof parsed.endpoint === "string" && parsed.endpoint.trim()) return parsed.endpoint.trim();
+    } catch { /* 用默认 */ }
+    return RELAY_ENDPOINT_FALLBACK;
+}
+
 async function resolveLatestSha(source: ResourceHubSource): Promise<string | null> {
     try {
         const res = await fetchWithTimeout(
@@ -78,7 +87,22 @@ async function resolveLatestSha(source: ResourceHubSource): Promise<string | nul
             const sha = (await res.text()).trim();
             if (/^[0-9a-f]{40}$/i.test(sha)) return sha;
         }
-    } catch { /* 拿不到就退回分支名 */ }
+    } catch { /* 走中转站兜底 */ }
+    // GitHub API 匿名配额（60 次/小时）耗尽时,请中转站代查——否则退回分支名,
+    // jsDelivr 对分支的缓存可滞后数小时,刚上传/更新的资源会一直显示旧版
+    try {
+        const res = await fetchWithTimeout(relayEndpoint(), {
+            method: "POST",
+            headers: { "Content-Type": "application/json" },
+            body: JSON.stringify({ action: "head" }),
+        });
+        if (res.ok) {
+            const data = await res.json() as { ok?: boolean; sha?: string; repo?: string };
+            if (data.ok && data.repo === `${source.owner}/${source.repo}` && /^[0-9a-f]{40}$/i.test(data.sha || "")) {
+                return (data.sha as string);
+            }
+        }
+    } catch { /* 兜底也失败就退回分支名 */ }
     return null;
 }
 
@@ -303,6 +327,7 @@ export function checkImportFileForDestination(destination: ImportDestination, pa
         case "worldbook":
         case "game":
         case "theater":
+        case "status_bar":
             return isJson ? null : "该目的地需要 JSON 文件";
         case "character":
             return isJson || lower.endsWith(".png") ? null : "角色卡需要 JSON 或 PNG 文件";
@@ -321,6 +346,8 @@ export function checkImportFileForDestination(destination: ImportDestination, pa
             // 真正的校验在 installThemePackageFile 里按包内 manifest.json 做，
             // 这里只是个便宜的前置过滤。
             return lower.endsWith(".zip") || lower.endsWith(".ai-theme") ? null : "主题包需要 zip 文件（旧版 .ai-theme 也可以）";
+        case "mixology":
+            return isJson || lower.endsWith(".png") ? null : "特调材料需要 JSON 或 PNG 文件（独家特调的导出格式）";
     }
 }
 
@@ -404,7 +431,7 @@ export async function importResourceHubFile(
     source: ResourceHubSource,
     path: string,
     destination: ImportDestination,
-    options?: { contactId?: string },
+    options?: { contactId?: string; authorName?: string },
 ): Promise<string> {
     // 下面全是"读出来 → 加一条 → 整份写回"。kv 的 kvSet 是无条件覆盖、kvGet 在
     // 水合前一律返回 null，抢在加载完成前写会把整份旧数据（角色库/主题/草稿/插件）
@@ -425,6 +452,18 @@ export async function importResourceHubFile(
             savePresets([preset, ...loadPresets()]);
             dispatch("settings-presets-updated");
             return `预设「${preset.name}」已导入`;
+        }
+        case "status_bar": {
+            const statusText = await fetchResourceHubText(source, path);
+            let statusParsed: Record<string, unknown>;
+            try { statusParsed = JSON.parse(statusText) as Record<string, unknown>; }
+            catch { throw new Error("状态栏解析失败，请确认文件是聊天信息页导出的 JSON"); }
+            const statusContract = typeof statusParsed.contract === "string" ? statusParsed.contract : "";
+            const statusRender = typeof statusParsed.renderHtml === "string" ? statusParsed.renderHtml : "";
+            if (!statusContract.trim() || !statusRender.trim()) throw new Error("状态栏解析失败，缺少输出契约或渲染代码");
+            const statusPreview = typeof statusParsed.previewRaw === "string" ? statusParsed.previewRaw : "";
+            saveScheme(STATUS_REGION_SCHEME_TARGET, displayName, JSON.stringify({ contract: statusContract, renderHtml: statusRender, previewRaw: statusPreview }));
+            return `状态栏方案「${displayName}」已存入方案库，在聊天信息 → 自定义状态栏中应用`;
         }
         case "regex": {
             const regexText = await fetchResourceHubText(source, path);
@@ -531,45 +570,98 @@ export async function importResourceHubFile(
             if (payload?.type !== "ai-phone-game-draft" || !payload.draft || typeof payload.draft !== "object") {
                 throw new Error("不是有效的游戏草稿文件（需要游戏草稿箱「导出文件」生成）");
             }
+            // 别人的作品直接进「我的柜子」当成品玩，不进草稿箱——草稿是可编辑
+            // 可发布的，落草稿等于开了二次编辑与转发布的口子。
+            // 字段逐个安全取值：文件是外来的，任何字段都可能不是字符串
+            const gameDraft = payload.draft as Record<string, unknown>;
+            const gstr = (key: string): string => (typeof gameDraft[key] === "string" ? (gameDraft[key] as string).trim() : "");
+            const { parseGameRoleSlots, upsertLocalTestGame } = await import("./game-storage");
+            const { GAME_EMPTY_PICKER_HTML } = await import("./game-creator-guide");
+            const title = (typeof payload.title === "string" && payload.title.trim()) || gstr("title") || displayName;
+            const roleSlots = parseGameRoleSlots(gstr("roleSlotsText"));
             const now = new Date().toISOString();
-            const title = (typeof payload.title === "string" && payload.title.trim()) || displayName;
-            saveGameDrafts([
-                {
-                    id: `draft_${Date.now()}_${Math.random().toString(36).slice(2, 6)}`,
-                    title,
-                    draft: payload.draft as GameTemplateDraft,
-                    // 别人的作品：本机可试玩，不能发布到共享大厅
-                    importedFrom: path,
-                    createdAt: now,
-                    updatedAt: now,
-                },
-                ...loadGameDrafts(),
-            ]);
-            return `游戏草稿「${title}」已导入草稿箱，可在游戏工作室试玩（集市来的作品不能发布到大厅）`;
+            // 稳定 key 来自集市路径：作者更新资源后重复导入，原地更新同一件
+            const hubSlug = `hub_${path.toLowerCase().replace(/[^a-z0-9]+/g, "_").slice(-80)}`;
+            const gameResult = upsertLocalTestGame(hubSlug, {
+                id: hubSlug,
+                title,
+                codeName: gstr("codeName"),
+                subtitle: gstr("subtitle"),
+                synopsis: gstr("synopsis"),
+                playNote: gstr("playNote"),
+                coverImage: gstr("coverImage"),
+                tags: gstr("tagsText").split(/[\s,，、]+/).filter(Boolean).slice(0, 8),
+                authorId: "resource_hub",
+                authorName: gstr("authorName") || options?.authorName?.trim() || "集市投稿人",
+                authorAvatar: "",
+                source: "local",
+                version: 1,
+                roleSlots,
+                pickerHtml: roleSlots.length > 0 ? gstr("pickerHtml") : GAME_EMPTY_PICKER_HTML,
+                gameHtml: gstr("gameHtml"),
+                allowExternalControl: gameDraft.allowExternalControl === true,
+                purchaseCount: 0,
+                rating: 0,
+                likeCount: 0,
+                favoriteCount: 0,
+                commentCount: 0,
+                createdAt: now,
+                updatedAt: now,
+            });
+            if (!gameResult.ok) throw new Error(gameResult.error || "游戏包无效");
+            return `游戏「${title}」已进我的柜子，直接可玩（集市来的作品不能编辑，也不能发布到大厅）`;
         }
         case "theater": {
             const payload = JSON.parse(await fetchResourceHubText(source, path)) as { type?: string; title?: string; draft?: unknown };
             if (payload?.type !== "ai-phone-theater-draft" || !payload.draft || typeof payload.draft !== "object") {
                 throw new Error("不是有效的剧场草稿文件（需要剧场草稿箱「导出文件」生成）");
             }
-            const now = new Date().toISOString();
-            const title = (typeof payload.title === "string" && payload.title.trim()) || displayName;
-            // 与黑市工作室共用同一 kv 键与记录形状（black-market-app / qa-content-tools 同款）
-            const key = "ai_phone_black_market_studio_drafts_v1";
-            let drafts: unknown[] = [];
-            try { drafts = JSON.parse(kvGet(key) || "[]") as unknown[]; } catch { drafts = []; }
-            if (!Array.isArray(drafts)) drafts = [];
-            drafts.unshift({
-                id: `bmdraft_${Date.now()}_${Math.random().toString(36).slice(2, 6)}`,
-                title,
-                draft: payload.draft,
-                // 别人的作品：本机可用，不能上架到黑市
-                importedFrom: path,
-                createdAt: now,
-                updatedAt: now,
+            // 别人的作品直接进「本地暗柜」当成品演，不进草稿箱——理由同游戏：
+            // 草稿可编辑可上架，落草稿等于开了二次编辑与转发布的口子。
+            const theaterDraft = payload.draft as Record<string, unknown>;
+            const str = (key: string): string => (typeof theaterDraft[key] === "string" ? (theaterDraft[key] as string).trim() : "");
+            const theaterTitle = (typeof payload.title === "string" && payload.title.trim()) || str("title") || displayName;
+            const aiInstruction = str("aiInstruction");
+            const openingHtml = str("openingHtml");
+            if (!aiInstruction || !openingHtml) throw new Error("剧场草稿缺少演出指令或开场画面");
+            let renderRules: unknown[] = [];
+            try {
+                const parsedRules = JSON.parse(str("renderRulesText") || "[]");
+                if (Array.isArray(parsedRules)) renderRules = parsedRules;
+            } catch { renderRules = []; }
+            const { upsertLocalTestTheater } = await import("./black-market-storage");
+            const theaterNow = new Date().toISOString();
+            const theaterSlug = `hub_${path.toLowerCase().replace(/[^a-z0-9]+/g, "_").slice(-80)}`;
+            const theaterResult = upsertLocalTestTheater(theaterSlug, {
+                id: theaterSlug,
+                title: theaterTitle,
+                codeName: str("codeName"),
+                subtitle: str("subtitle"),
+                synopsis: str("synopsis"),
+                storyText: str("storyText"),
+                tags: str("tagsText").split(/[\s,，、]+/).filter(Boolean).slice(0, 8),
+                rarity: "common",
+                glyph: "◆",
+                price: 0,
+                authorId: "resource_hub",
+                authorName: str("authorName") || options?.authorName?.trim() || "集市投稿人",
+                source: "local",
+                version: 1,
+                durationTurns: 8,
+                allowExternalControl: theaterDraft.allowExternalControl === true,
+                openingHtml,
+                aiInstruction,
+                outputContract: str("outputContract"),
+                renderRules: renderRules as never,
+                renderCss: str("renderCss"),
+                memorySummaryPrompt: str("memorySummaryPrompt"),
+                purchaseCount: 0,
+                rating: 0,
+                createdAt: theaterNow,
+                updatedAt: theaterNow,
             });
-            kvSet(key, JSON.stringify(drafts.slice(0, 80)));
-            return `剧场草稿「${title}」已导入草稿箱，可在黑市工作室查看（集市来的作品不能上架）`;
+            if (!theaterResult.ok) throw new Error(theaterResult.error || "夜间档案无效");
+            return `剧场「${theaterTitle}」已进本地暗柜，可直接开演（集市来的作品不能编辑，也不能上架）`;
         }
         case "theme": {
             const buffer = await fetchResourceHubBinary(source, path);
@@ -585,6 +677,45 @@ export async function importResourceHubFile(
             // 这条目的地要先选预设和位置，走 fetchPresetEntry + applyPresetEntry 两步，
             // 不经过这里。留个明确的兜底，免得以后有人直接调进来静默什么都不做。
             throw new Error("预设条目需要先选择目标预设与位置");
+        case "mixology": {
+            const { importMixRecipePack, parseMixMaterialsFromJson, parseMixMaterialsFromPng, parseMixRecipeFile } = await import("./mixology/transfer");
+            const { loadMixCabinet, saveMixMaterial, MIX_CABINET_UPDATED_EVENT } = await import("./mixology/storage");
+            const { MIX_KIND_LABELS } = await import("./mixology/types");
+            let materials;
+            if (lower.endsWith(".png")) {
+                materials = parseMixMaterialsFromPng(await fetchResourceHubBinary(source, path));
+            } else {
+                const text = await fetchResourceHubText(source, path);
+                // 配方文件（整杯打包）：配方与材料一起落库，规矩同下
+                const pack = parseMixRecipeFile(text);
+                if (pack) return importMixRecipePack(pack, options?.authorName);
+                materials = parseMixMaterialsFromJson(text);
+            }
+            if (!materials.length) throw new Error("没有解析到特调材料，请确认文件是独家特调导出的 JSON 或 PNG");
+            // 种类与件数文件自带，全部自动入柜，用户不用选。集市来源打 imported 标记，
+            // 与酒材大厅入柜同一套规矩：不能发布、不能编辑，角色卡正文封存，小卷工具拒改。
+            // 同名同类的旧导入件就地更新（作者更新资源再导，不堆一柜副本）；
+            // 自己的原件 id 不同，永远不会被动到。
+            let updated = 0;
+            for (const material of materials) {
+                const prior = loadMixCabinet().find(
+                    (m) => m.imported && m.kind === material.kind && m.name.trim() === material.name.trim(),
+                );
+                if (prior) updated += 1;
+                saveMixMaterial({
+                    ...material,
+                    id: prior?.id ?? material.id,
+                    imported: true,
+                    author: options?.authorName?.trim() || material.author,
+                    createdAt: prior?.createdAt ?? material.createdAt,
+                });
+            }
+            dispatch(MIX_CABINET_UPDATED_EVENT);
+            const listed = materials.slice(0, 4).map((m) => `${MIX_KIND_LABELS[m.kind]}「${m.name}」`).join("、");
+            const more = materials.length > 4 ? ` 等 ${materials.length} 件` : "";
+            const updatedNote = updated ? `，其中 ${updated} 件是柜中导入件的更新` : "";
+            return `${listed}${more}已入柜${updatedNote}（集市来的作品不能发布，角色卡不可编辑）`;
+        }
         case "plugin": {
             const code = await fetchResourceHubText(source, path);
             const { installChatPluginFromCode } = await import("./chat-plugin-loader");

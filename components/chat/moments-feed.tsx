@@ -12,7 +12,8 @@ import { ConfirmDialog } from "@/components/ui/modal";
 import { PageShell } from "@/components/ui/page-shell";
 import { AlertCircle } from "lucide-react";
 import { kvGet, kvSet, registerKvMigration } from "@/lib/kv-db";
-import { onUserComment } from "@/lib/moments-engine";
+import { onUserComment, MOMENT_PHOTO_GENERATION_FAILED_EVENT } from "@/lib/moments-engine";
+import { GeneratedImageErrorDialog } from "./generated-image-error-dialog";
 
 const COVER_ASSET_KEY = "moments_cover_asset_id";
 registerKvMigration(COVER_ASSET_KEY);
@@ -44,6 +45,8 @@ export function MomentsFeed({ onCloseApp }: MomentsFeedProps) {
     const [posts, setPosts] = useState<MomentPost[]>([]);
     const [showCompose, setShowCompose] = useState(false);
     const [confirmDeleteId, setConfirmDeleteId] = useState<string | null>(null);
+    // 后台生图失败：弹一次弹窗提示，关掉即消失（同时多条失败只提示第一条）
+    const [photoFailureNotice, setPhotoFailureNotice] = useState<string | null>(null);
     const [coverUrl, setCoverUrl] = useState<string | null>(null);
     const coverInputRef = useRef<HTMLInputElement>(null);
     const scrollRef = useRef<HTMLDivElement>(null);
@@ -290,6 +293,12 @@ export function MomentsFeed({ onCloseApp }: MomentsFeedProps) {
         const handler = () => refreshPosts();
         window.addEventListener("moments-updated", handler);
 
+        const photoFailureHandler = (event: Event) => {
+            const reason = (event as CustomEvent<{ message?: string }>).detail?.message;
+            setPhotoFailureNotice(prev => prev ?? (reason || "生图配置未启用或生成失败"));
+        };
+        window.addEventListener(MOMENT_PHOTO_GENERATION_FAILED_EVENT, photoFailureHandler);
+
         // Load saved cover image
         const savedId = kvGet(COVER_ASSET_KEY);
         if (savedId) {
@@ -300,6 +309,7 @@ export function MomentsFeed({ onCloseApp }: MomentsFeedProps) {
 
         return () => {
             window.removeEventListener("moments-updated", handler);
+            window.removeEventListener(MOMENT_PHOTO_GENERATION_FAILED_EVENT, photoFailureHandler);
         };
     }, [refreshPosts]);
 
@@ -363,6 +373,12 @@ export function MomentsFeed({ onCloseApp }: MomentsFeedProps) {
 
     return (
         <>
+        {photoFailureNotice && (
+            <GeneratedImageErrorDialog
+                message={photoFailureNotice}
+                onClose={() => setPhotoFailureNotice(null)}
+            />
+        )}
         <PageShell
             title="动态"
             onBack={onCloseApp}

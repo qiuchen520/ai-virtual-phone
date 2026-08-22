@@ -2,6 +2,7 @@
 
 import type { CSSProperties, ReactNode } from "react";
 import { ChevronRight, type LucideIcon } from "lucide-react";
+import { GlassIcon } from "./glass-icon";
 
 /* ── Card item definition ── */
 export type CardItem = {
@@ -10,6 +11,8 @@ export type CardItem = {
   label: string;
   desc?: string;
   iconColor: string;
+  /** 传了就用 <GlassIcon name={glassIcon}> 那张玻璃图标，替代上面的线性 icon */
+  glassIcon?: string;
   onClick: () => void;
 };
 
@@ -40,8 +43,11 @@ export function CardGrid({
               type="button"
               onClick={item.onClick}
             >
-              <span className="card-icon" style={cardIconStyle(item.iconColor)}>
-                <Icon size={22} strokeWidth={1.75} />
+              <span
+                className={`card-icon${item.glassIcon ? " card-icon-glass" : ""}`}
+                style={item.glassIcon ? undefined : cardIconStyle(item.iconColor)}
+              >
+                {item.glassIcon ? <GlassIcon name={item.glassIcon} /> : <Icon size={22} strokeWidth={1.75} />}
               </span>
               <span className="card-card-body">
                 <span className="card-label">{item.label}</span>
@@ -67,8 +73,11 @@ export function FeaturedCard({ item }: { item: FeaturedCardItem }) {
       type="button"
       onClick={item.onClick}
     >
-      <span className="card-icon" style={cardIconStyle(item.iconColor)}>
-        <Icon size={22} strokeWidth={1.75} />
+      <span
+        className={`card-icon${item.glassIcon ? " card-icon-glass" : ""}`}
+        style={item.glassIcon ? undefined : cardIconStyle(item.iconColor)}
+      >
+        {item.glassIcon ? <GlassIcon name={item.glassIcon} /> : <Icon size={22} strokeWidth={1.75} />}
       </span>
       <div className="card-featured-body">
         <div className="card-featured-label">{item.label}</div>

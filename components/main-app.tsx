@@ -13,6 +13,7 @@ import { hydrateKvDb } from "@/lib/kv-db";
 import { getThemeAssetMap, readThemeProfile } from "@/lib/theme-storage";
 import { resolveActiveIconSkins, type ThemeProfile } from "@/lib/theme-types";
 import { hasPendingMcpOAuthCallback } from "@/lib/tool-executor";
+import { shouldRequestPwaFullscreen } from "@/lib/pwa-display-mode";
 
 const TEXT = {
   loading: "\u52A0\u8F7D\u4E2D...",
@@ -231,6 +232,10 @@ export function MainApp() {
   useEffect(() => {
     let cancelled = false;
 
+    // 申请持久化存储：批准后 iOS/安卓不会再因存储压力擅自回收 IndexedDB
+    // （摊主钥匙、聊天记录等都存在里面）。静默尽力而为，被拒也无碍。
+    void navigator.storage?.persist?.().catch(() => {});
+
     void (async () => {
       await hydrateKvDb();
       if (cancelled) return;
@@ -250,20 +255,18 @@ export function MainApp() {
       }
     })();
 
-    // 安卓全屏兜底：点击屏幕进入全屏模式（iOS 不支持此 API，会自动忽略）
+    // 安卓全屏兜底。是否请求全屏在每次点击时读取，设置切换后无需重载。
     const isMobile = window.matchMedia("(max-width: 500px) and (hover: none) and (pointer: coarse)").matches;
-    // Edge 改用 minimal-ui 保留原生状态栏，不能再被强制全屏顶掉（仅 Edge 跳过，其它浏览器照旧）
-    const isEdge = /Edg/i.test(navigator.userAgent);
-    if (!isMobile || isEdge) return () => {
+    if (!isMobile) return () => {
       cancelled = true;
     };
 
     function tryFullscreen() {
+      if (!shouldRequestPwaFullscreen()) return;
       const doc = document.documentElement;
       if (document.fullscreenElement) return;
       doc.requestFullscreen?.().catch(() => { });
     }
-    // 每次点击都尝试进入全屏（退出后可重新进入）
     document.addEventListener("click", tryFullscreen);
     return () => {
       cancelled = true;

@@ -1,7 +1,7 @@
 "use client";
 
-import { useState, useEffect, useRef, useCallback, useMemo } from "react";
-import { Bot, ChevronDown, ChevronRight, Languages, Menu, Minus, PenLine, SendHorizontal, X } from "lucide-react";
+import { useState, useEffect, useRef, useCallback, useMemo, useLayoutEffect } from "react";
+import { Bot, ChevronDown, ChevronRight, Languages, Menu, Minus, PenLine, Rocket, SendHorizontal, X, ZoomIn } from "lucide-react";
 import {
     loadChapters,
     loadProgress,
@@ -18,7 +18,7 @@ import {
     DEFAULT_READING_INTERACTION_CONFIG,
 } from "@/lib/reading-storage";
 import { generateAnnotationBatch, generateReadingChat, parseReadingDiscussResponse, type ReadingDiscussAction, type ReadingDiscussContext } from "@/lib/reading-engine";
-import { loadChatMessages, pushChatMessage, deleteChatMessage, editChatMessage, loadChatContacts, loadChatSessions, isReadingDiscussMessage } from "@/lib/chat-storage";
+import { loadChatMessages, pushChatMessage, deleteChatMessage, editChatMessage, loadChatContacts, createOrGetSession, isReadingDiscussMessage } from "@/lib/chat-storage";
 import type { ChatMessage, ChatSession } from "@/lib/chat-storage";
 import { loadCharacters } from "@/lib/character-storage";
 import { parseAIResponse } from "@/lib/rich-message-parser";
@@ -59,6 +59,11 @@ const DISCUSS_TARGET_CHARS = 1000;
 const DISCUSS_MIN_CHARS = 700;
 const DISCUSS_MAX_CHARS = 1600;
 const DISCUSS_MAX_PARAGRAPHS = 16;
+const MAX_MANUAL_PDF_PREFETCH_PAGES = 30;
+
+/** 聊天悬浮球/悬浮条/悬浮窗的位置记忆键 */
+const CHAT_FLOAT_POS_KEY = "reading-chat-float-pos-v1";
+const CHAT_FLOAT_MARGIN = 12;
 
 function toCanvasFont(style: CSSStyleDeclaration): string {
     return [
@@ -76,6 +81,22 @@ function formatParagraphRangeLabel(start: number, end: number): string {
 
 function getParagraphLength(text: string): number {
     return text.replace(/\s+/g, "").length || text.trim().length;
+}
+
+/** 静默重试：生成失败时按用户配置的次数重试，重试间隔逐渐加大，全部失败后抛出最后一次错误 */
+async function withAnnotationRetry<T>(task: () => Promise<T>, retryCount: number): Promise<T> {
+    const maxAttempts = Math.max(1, retryCount + 1);
+    let lastError: unknown = null;
+    for (let attempt = 1; attempt <= maxAttempts; attempt += 1) {
+        try {
+            return await task();
+        } catch (err) {
+            lastError = err;
+            if (attempt >= maxAttempts) break;
+            await new Promise<void>((resolve) => setTimeout(resolve, Math.min(1200, 400 * attempt)));
+        }
+    }
+    throw lastError;
 }
 
 function buildPdfChunkTitle(startPage: number, endPage: number): string {
@@ -213,6 +234,12 @@ type Props = {
 export function ReadingViewer({ book, onBack }: Props) {
     const isPdf = book.format === "pdf";
     const [readingConfig, setReadingConfig] = useState(() => loadReadingInteractionConfig());
+    // 阅读器保持挂载（返回书架不卸载），书架设置页保存后通过事件同步最新配置
+    useEffect(() => {
+        const reload = () => setReadingConfig(loadReadingInteractionConfig());
+        window.addEventListener("reading-interaction-config-changed", reload);
+        return () => window.removeEventListener("reading-interaction-config-changed", reload);
+    }, []);
     const [chapters, setChapters] = useState<BookChapter[]>([]);
     const [chapterIndex, setChapterIndex] = useState(0);
     const [pdfCurrentPage, setPdfCurrentPage] = useState(1);
@@ -231,7 +258,19 @@ export function ReadingViewer({ book, onBack }: Props) {
     }, [showCharPicker, charPickerClosing]);
     const [showChat, setShowChat] = useState(false);
     const [chatExpanded, setChatExpanded] = useState(false);
-    const [chatOffset, setChatOffset] = useState({ x: 0, y: 0 });
+    const [chatOffset, setChatOffset] = useState<{ x: number; y: number }>(() => {
+        try {
+            const raw = localStorage.getItem(CHAT_FLOAT_POS_KEY);
+            if (!raw) return { x: 0, y: 0 };
+            const parsed = JSON.parse(raw) as { x?: unknown; y?: unknown };
+            if (typeof parsed.x === "number" && typeof parsed.y === "number" && Number.isFinite(parsed.x) && Number.isFinite(parsed.y)) {
+                return { x: parsed.x, y: parsed.y };
+            }
+        } catch {
+            // ignore storage errors
+        }
+        return { x: 0, y: 0 };
+    });
     const [isDragging, setIsDragging] = useState(false);
     const [chatInput, setChatInput] = useState("");
     const [chatMessages, setChatMessages] = useState<ChatMessage[]>([]);
@@ -241,8 +280,17 @@ export function ReadingViewer({ book, onBack }: Props) {
     const [annotationBatchInput, setAnnotationBatchInput] = useState(String(isPdf ? 5 : 50));
     const [annotationDialogMode, setAnnotationDialogMode] = useState<AnnotationDialogMode | null>(null);
     const [showReadingSettings, setShowReadingSettings] = useState(false);
+    const [pdfRenderDraft, setPdfRenderDraft] = useState(() => ({
+        pdfZoom: readingConfig.pdfZoom ?? 1,
+        pdfPreloadRadius: readingConfig.pdfPreloadRadius ?? 3,
+        pdfPreloadEnabled: readingConfig.pdfPreloadEnabled !== false,
+    }));
     const [showNavigationDialog, setShowNavigationDialog] = useState(false);
     const [pdfJumpPage, setPdfJumpPage] = useState<number | undefined>(undefined);
+    /** PDF 手动预批注对话框：自定义起始页/结束页，确认后立即预解析并预生成该范围批注 */
+    const [pdfPrefetchDialogOpen, setPdfPrefetchDialogOpen] = useState(false);
+    const [pdfPrefetchStartInput, setPdfPrefetchStartInput] = useState("");
+    const [pdfPrefetchEndInput, setPdfPrefetchEndInput] = useState("");
     const [chaptersLoaded, setChaptersLoaded] = useState(false);
     const touchStartRef = useRef({ x: 0, y: 0 });
     const [activeMessageId, setActiveMessageId] = useState<string | null>(null);
@@ -256,15 +304,31 @@ export function ReadingViewer({ book, onBack }: Props) {
     const chatDragRef = useRef<{ pointerId: number; startX: number; startY: number; originX: number; originY: number } | null>(null);
     const chatMovedRef = useRef(false);
     const scrollRef = useRef<HTMLDivElement>(null);
+    const chatListRef = useRef<HTMLDivElement>(null); // 共读讨论悬浮窗消息列表（滚动容器）
     const txtMeasureLineRef = useRef<HTMLParagraphElement>(null);
     const txtMeasureGapRef = useRef<HTMLDivElement>(null);
     const txtMeasureAnnotationRef = useRef<HTMLDivElement>(null);
     const generatedBatchesRef = useRef<Set<string>>(new Set());
-    const autoBootstrapInFlightRef = useRef(false);
+    /** 同步「生成中」锁：防止 auto/prefetch 竞态导致同一帧内并发发起多个批注生成任务 */
+    const annotationInFlightRef = useRef(false);
+    /** 正在生成中的批次 key：防止同一批在生成完成前被再次发起 */
+    const inFlightBatchesRef = useRef<Set<string>>(new Set());
     const pendingTxtPageFractionRef = useRef<number | null>(null);
     const lastTxtPaginationSignatureRef = useRef("");
+    // 滚动阅读模式：连续滚动（多章窗口无缝衔接）
+    const scrollFractionRef = useRef(0);
+    const initialScrollFractionRef = useRef<number | null>(null); // 打开书时保存的章节内比例
+    const pendingScrollFractionRef = useRef<number | null>(null); // 滑块跨章待定位比例
+    const scrollContentRef = useRef<HTMLDivElement>(null);        // 滚动内容容器（含多章块）
+    const chapterMetricsRef = useRef<Map<number, { top: number; height: number }>>(new Map()); // 各章块在滚动坐标系中的 top/height
+    const pendingScrollActionRef = useRef<{ kind: "shift-forward"; oldScrollTop: number; removedHeight: number } | { kind: "shift-backward"; oldScrollTop: number } | null>(null);
+    const shiftCooldownRef = useRef(false);                      // 窗口平移后的冷却期，防止边界来回抖动
+    const scrollPositionedKeyRef = useRef("");                   // 已做过初始定位的「书+模式」标识
+    const chapterIndexRef = useRef(0);
+    const chaptersLenRef = useRef(0);
     const [txtLayoutVersion, setTxtLayoutVersion] = useState(0);
     const [txtPages, setTxtPages] = useState<TxtPageItem[][]>([]);
+    const [scrollFraction, setScrollFraction] = useState(0);
     const [flipAnim, setFlipAnim] = useState<{ direction: 'forward' | 'backward'; items: TxtPageItem[] } | null>(null);
 
     const [enrichedContacts, setEnrichedContacts] = useState<(ReturnType<typeof loadChatContacts>[number] & { char: Character })[]>([]);
@@ -293,12 +357,39 @@ export function ReadingViewer({ book, onBack }: Props) {
     const companion = companionId ? (enrichedContacts.find(c => c.characterId === companionId)?.char || loadCharacters().find(c => c.id === companionId)) : null;
     const bilingualTranslationEnabled = readingConfig.bilingualTranslationEnabled === true;
     const defaultTranslationExpanded = readingConfig.collapseBilingualTranslation !== true;
+    const isScrollMode = !isPdf && readingConfig.readingMode === "scroll";
+    // 保持 ref 与最新状态同步（供长生命周期滚动回调读取）
+    chapterIndexRef.current = chapterIndex;
+    chaptersLenRef.current = chapters.length;
+    // 滚动模式渲染的章节窗口：上一章 + 当前章 + 下一章（无缝衔接用）
+    const windowChapters = useMemo(() => {
+        if (chapters.length === 0) return [] as BookChapter[];
+        const start = Math.max(0, chapterIndex - 1);
+        const end = Math.min(chapters.length - 1, chapterIndex + 1);
+        const out: BookChapter[] = [];
+        for (let i = start; i <= end; i++) out.push(chapters[i]);
+        return out;
+    }, [chapters, chapterIndex]);
+    // 滚动模式：将「章节内比例(0-1)」换算为具体滚动位置（窗口布局下按当前章块定位）
+    const scrollToChapterFraction = useCallback((fraction: number, targetChapterIndex: number) => {
+        const body = scrollRef.current;
+        if (!body) return;
+        const metrics = chapterMetricsRef.current.get(targetChapterIndex);
+        if (!metrics) return;
+        const maxScroll = Math.max(0, body.scrollHeight - body.clientHeight);
+        const span = Math.max(0, metrics.height - body.clientHeight);
+        const target = Math.max(0, Math.min(maxScroll, metrics.top + Math.max(0, Math.min(1, fraction)) * span));
+        body.scrollTop = target;
+        const actual = span > 0 ? Math.min(1, Math.max(0, (target - metrics.top) / span)) : 0;
+        scrollFractionRef.current = actual;
+        setScrollFraction(actual);
+    }, []);
     const currentChapter = chapters[chapterIndex];
     const txtPagesChapterIndex = txtPages[0]?.find((item) => item.kind !== "gap")?.chapterIndex ?? txtPages[0]?.[0]?.chapterIndex;
-    const txtPagesReadyForCurrentChapter = !isPdf && txtPages.length > 0 && txtPagesChapterIndex === chapterIndex;
+    const txtPagesReadyForCurrentChapter = !isPdf && !isScrollMode && txtPages.length > 0 && txtPagesChapterIndex === chapterIndex;
     const showTxtLoading = !isPdf && (
         !chaptersLoaded ||
-        (chaptersLoaded && chapters.length > 0 && Boolean(currentChapter) && !txtPagesReadyForCurrentChapter)
+        (chaptersLoaded && chapters.length > 0 && Boolean(currentChapter) && !isScrollMode && !txtPagesReadyForCurrentChapter)
     );
 
     const renderTxtPage = (pageIndex: number) => {
@@ -310,58 +401,61 @@ export function ReadingViewer({ book, onBack }: Props) {
                     item.kind === "gap"
                         ? <div key={i} className="reading-line-gap" />
                         : item.kind === "annotation"
-                            ? (
-                                <div
-                                    key={item.annotation.id}
-                                    className="reading-annotation reading-annotation-interactive"
-                                    data-no-nav="true"
-                                    onPointerDown={() => {
-                                        longPressTimer.current = setTimeout(() => {
-                                            setActiveMessageId(null);
-                                            setActiveAnnotationId(item.annotation.id);
-                                        }, 500);
-                                    }}
-                                    onPointerUp={() => { if (longPressTimer.current) clearTimeout(longPressTimer.current); }}
-                                    onPointerCancel={() => { if (longPressTimer.current) clearTimeout(longPressTimer.current); }}
-                                    onPointerLeave={() => { if (longPressTimer.current) clearTimeout(longPressTimer.current); }}
-                                    onClick={(e) => {
-                                        e.stopPropagation();
-                                        if (activeAnnotationId && activeAnnotationId !== item.annotation.id) setActiveAnnotationId(null);
-                                    }}
-                                >
-                                    <span className="reading-annotation-name">{item.annotation.characterName}</span>
-                                    <ReadingAnnotationContent
-                                        text={item.annotation.content}
-                                        bilingualEnabled={bilingualTranslationEnabled}
-                                        expanded={isAnnotationTranslationExpanded(item.annotation.id)}
-                                        onToggle={() => handleAnnotationTranslationToggle(item.annotation.id)}
-                                    />
-                                    {activeAnnotationId === item.annotation.id && (
-                                        <div className="ctx-menu reading-annotation-menu" onClick={(e) => e.stopPropagation()}>
-                                            <button
-                                                onClick={() => {
-                                                    copyToClipboard(item.annotation.content);
-                                                    setActiveAnnotationId(null);
-                                                }}
-                                                className="ctx-menu-btn"
-                                            >
-                                                复制
-                                            </button>
-                                            <button
-                                                onClick={() => { void handleDeleteReadingAnnotation(item.annotation.id); }}
-                                                className="ctx-menu-btn ctx-menu-btn-danger"
-                                            >
-                                                删除
-                                            </button>
-                                        </div>
-                                    )}
-                                </div>
-                            )
+                            ? renderAnnotationItem(item.annotation)
                             : <p key={i} className={`reading-line${item.indent ? " reading-line-indent" : ""}${item.segEnd ? " reading-line-seg-end" : ""}`}>{item.text}</p>
                 ))}
             </div>
         );
     };
+
+    // 批注块（翻页与滚动模式共用）：长按呼出 复制/删除 菜单
+    const renderAnnotationItem = (annotation: ReadingAnnotation) => (
+        <div
+            key={annotation.id}
+            className="reading-annotation reading-annotation-interactive"
+            data-no-nav="true"
+            onPointerDown={() => {
+                longPressTimer.current = setTimeout(() => {
+                    setActiveMessageId(null);
+                    setActiveAnnotationId(annotation.id);
+                }, 500);
+            }}
+            onPointerUp={() => { if (longPressTimer.current) clearTimeout(longPressTimer.current); }}
+            onPointerCancel={() => { if (longPressTimer.current) clearTimeout(longPressTimer.current); }}
+            onPointerLeave={() => { if (longPressTimer.current) clearTimeout(longPressTimer.current); }}
+            onClick={(e) => {
+                e.stopPropagation();
+                if (activeAnnotationId && activeAnnotationId !== annotation.id) setActiveAnnotationId(null);
+            }}
+        >
+            <span className="reading-annotation-name">{annotation.characterName}</span>
+            <ReadingAnnotationContent
+                text={annotation.content}
+                bilingualEnabled={bilingualTranslationEnabled}
+                expanded={isAnnotationTranslationExpanded(annotation.id)}
+                onToggle={() => handleAnnotationTranslationToggle(annotation.id)}
+            />
+            {activeAnnotationId === annotation.id && (
+                <div className="ctx-menu reading-annotation-menu" onClick={(e) => e.stopPropagation()}>
+                    <button
+                        onClick={() => {
+                            copyToClipboard(annotation.content);
+                            setActiveAnnotationId(null);
+                        }}
+                        className="ctx-menu-btn"
+                    >
+                        复制
+                    </button>
+                    <button
+                        onClick={() => { void handleDeleteReadingAnnotation(annotation.id); }}
+                        className="ctx-menu-btn ctx-menu-btn-danger"
+                    >
+                        删除
+                    </button>
+                </div>
+            )}
+        </div>
+    );
 
     const renderStaticPage = (items: TxtPageItem[]) => (
         <div className="reading-page-content">
@@ -439,13 +533,19 @@ export function ReadingViewer({ book, onBack }: Props) {
     // Find or create chat session for companion
     const getSession = useCallback((): ChatSession | null => {
         if (!companionId) return null;
-        const sessions = loadChatSessions();
-        return sessions.find(s => !s.isGroup && s.contactId === companionId) || null;
+        // 找不到与角色的一对一会话时自动创建（否则发送会静默无响应）
+        return createOrGetSession(companionId);
     }, [companionId]);
 
 
     // Load book data
     useEffect(() => {
+        // 清空上一本书遗留的滚动定位状态
+        initialScrollFractionRef.current = null;
+        pendingScrollFractionRef.current = null;
+        pendingScrollActionRef.current = null;
+        shiftCooldownRef.current = false;
+        scrollPositionedKeyRef.current = "";
         setChaptersLoaded(false);
         (async () => {
             let chs = await loadChapters(book.id);
@@ -454,7 +554,7 @@ export function ReadingViewer({ book, onBack }: Props) {
                 if (rawFile && rawFile.size > 0) {
                     try {
                         const parsed = book.format === "txt"
-                            ? parseTxtContent(decodeTxtArrayBuffer(await rawFile.arrayBuffer()).text, book.title)
+                            ? parseTxtContent(decodeTxtArrayBuffer(await rawFile.arrayBuffer(), loadReadingInteractionConfig().txtEncoding).text, book.title)
                             : await parseEpubFile(await rawFile.arrayBuffer(), book.title);
                         const rebuiltChapters: BookChapter[] = parsed.chapters.map((chapter, index) => ({
                             id: `${book.id}_ch${index}`,
@@ -486,7 +586,19 @@ export function ReadingViewer({ book, onBack }: Props) {
                     : 0;
                 setChapterIndex(safeChapterIndex);
                 setCompanionId(progress.companionCharacterId || null);
-                if (!isPdf) setTxtPage(Math.max(0, progress.scrollPosition || 0));
+                if (isPdf) {
+                    // PDF 恢复：scrollPosition 存的是「当前页 - 1」。
+                    // 同时设置 pdfCurrentPage（避免跳转前保存逻辑把它覆盖回第 1 页）
+                    // 与 pdfJumpPage（让 PdfPageRenderer 渲染完成后滚到该页）。
+                    const restoredPage = Math.max(1, Math.round((progress.scrollPosition ?? 0) + 1));
+                    setPdfCurrentPage(restoredPage);
+                    setPdfJumpPage(restoredPage);
+                } else if (progress.readingMode === "scroll") {
+                    // 滚动模式：scrollPosition 存的是章节内滚动比例(0-1)
+                    initialScrollFractionRef.current = Math.max(0, Math.min(1, progress.scrollPosition || 0));
+                } else {
+                    setTxtPage(Math.max(0, progress.scrollPosition || 0));
+                }
             }
             // Default companion: first contact
             if (!progress?.companionCharacterId && enrichedContacts.length > 0) {
@@ -548,10 +660,15 @@ export function ReadingViewer({ book, onBack }: Props) {
                 setAnnotations(groups.flat());
                 return;
             }
-            const annots = await loadAnnotations(book.id, chapterIndex);
-            setAnnotations(annots);
+            // 滚动模式：加载窗口内所有章节（上一章+当前章+下一章）的批注，
+            // 否则交界处批注缺失，且窗口平移时整组替换导致批注「时有时无」
+            const chapterIndexes = isScrollMode
+                ? [...new Set(windowChapters.map((c) => c.index))]
+                : [chapterIndex];
+            const groups = await Promise.all(chapterIndexes.map((idx) => loadAnnotations(book.id, idx)));
+            setAnnotations(groups.flat());
         })();
-    }, [book.id, chapterIndex, chapters, isPdf]);
+    }, [book.id, isPdf, isScrollMode, windowChapters]);
 
     // Load reading-discuss chat messages
     const refreshChatMessages = useCallback(() => {
@@ -626,16 +743,29 @@ export function ReadingViewer({ book, onBack }: Props) {
     }, [book.id, chapters, isPdf]);
 
     const buildTxtBatchRequest = useCallback((size: number, mode: AnnotationBatchMode): AnnotationBatchRequest | null => {
-        const pageItems = txtPages[txtPage] || [];
-        const visibleParagraphIndexes = [...new Set(
-            pageItems
-                .filter((item): item is Extract<TxtPageItem, { kind: "line" | "annotation" }> => item.kind === "line" || item.kind === "annotation")
-                .map((item) => item.paragraphIndex),
-        )].sort((a, b) => a - b);
-        if (visibleParagraphIndexes.length === 0) return null;
+        let minParagraphIndex: number;
+        let maxParagraphIndex: number;
 
-        const minParagraphIndex = visibleParagraphIndexes[0];
-        const maxParagraphIndex = visibleParagraphIndexes[visibleParagraphIndexes.length - 1];
+        if (isScrollMode) {
+            // 滚动模式没有分页：以当前滚动比例估算「正在阅读」的段落窗口
+            const total = currentChapter?.paragraphs.length || 0;
+            if (total === 0) return null;
+            const center = Math.round(Math.max(0, Math.min(1, scrollFraction)) * (total - 1));
+            const half = Math.max(1, Math.ceil(size / 2));
+            minParagraphIndex = Math.max(0, center - half);
+            maxParagraphIndex = Math.min(total - 1, center + half);
+        } else {
+            const pageItems = txtPages[txtPage] || [];
+            const visibleParagraphIndexes = [...new Set(
+                pageItems
+                    .filter((item): item is Extract<TxtPageItem, { kind: "line" | "annotation" }> => item.kind === "line" || item.kind === "annotation")
+                    .map((item) => item.paragraphIndex),
+            )].sort((a, b) => a - b);
+            if (visibleParagraphIndexes.length === 0) return null;
+            minParagraphIndex = visibleParagraphIndexes[0];
+            maxParagraphIndex = visibleParagraphIndexes[visibleParagraphIndexes.length - 1];
+        }
+
         const visibleRefs = paragraphRefs.filter((item) => item.chapterIndex === chapterIndex && item.paragraphIndex >= minParagraphIndex && item.paragraphIndex <= maxParagraphIndex);
         if (visibleRefs.length === 0) return null;
 
@@ -664,7 +794,7 @@ export function ReadingViewer({ book, onBack }: Props) {
             size,
             items,
         };
-    }, [chapterIndex, paragraphRefs, txtPage, txtPages]);
+    }, [chapterIndex, currentChapter, isScrollMode, paragraphRefs, scrollFraction, txtPage, txtPages]);
 
     const getPdfBatchWindow = useCallback((size: number, mode: AnnotationBatchMode) => {
         const chapterMaxPage = Math.max(0, ...chapters.map((chapter) => chapter.pageEnd ?? 0));
@@ -708,31 +838,39 @@ export function ReadingViewer({ book, onBack }: Props) {
         return buildPdfBatchRequest(size, mode, refs);
     }, [buildPdfBatchRequest, buildTxtBatchRequest, ensurePdfPageRangeParsed, getPdfBatchWindow, isPdf]);
 
-    const executeBatchAnnotation = useCallback(async (request: AnnotationBatchRequest, options?: { force?: boolean }) => {
-        if (!companionId || generating) return;
+    const executeBatchAnnotation = useCallback(async (request: AnnotationBatchRequest, options?: { force?: boolean }): Promise<boolean> => {
+        if (!companionId) return false;
         const batchKey = `${book.id}:${companionId}:${request.key}`;
-        if (!options?.force && generatedBatchesRef.current.has(batchKey)) return;
-
+        if (!options?.force && generatedBatchesRef.current.has(batchKey)) return false;
+        // 同步锁：同一时间只允许一个批注生成任务（auto/prefetch 竞态时后面的请求直接跳过，
+        // 避免闭包里的 generating 旧值放行并发请求，导致同一批被重复生成）
+        if (annotationInFlightRef.current) return false;
+        // 同一批已在生成中：跳过（生成完成前 generatedBatchesRef 尚未写入，需用 in-flight 集合兜底）
+        if (!options?.force && inFlightBatchesRef.current.has(batchKey)) return false;
+        annotationInFlightRef.current = true;
+        inFlightBatchesRef.current.add(batchKey);
         setGenerating(true);
         setAnnotationError(null);
 
         try {
+            // 历史已有批注仅作为生成参考传入（generateAnnotationBatch 接收 existingAnnotations），
+            // 不用于跳过：重新开启自动批注/重读书籍时，用户期望生成新的批注。
+            // 「本次阅读体验内不重复」由 generatedBatchesRef（内存）保证。
             const existing = await loadExistingAnnotationsForItems(request.items);
-            if (!options?.force && existing.length > 0) {
-                generatedBatchesRef.current.add(batchKey);
-                return;
-            }
 
-            const newAnnotations = await generateAnnotationBatch(
-                book,
-                request.title,
-                request.items.map((item) => ({
-                    chapterIndex: item.chapterIndex,
-                    paragraphIndex: item.paragraphIndex,
-                    text: item.text,
-                })),
-                existing,
-                companionId,
+            const newAnnotations = await withAnnotationRetry(
+                () => generateAnnotationBatch(
+                    book,
+                    request.title,
+                    request.items.map((item) => ({
+                        chapterIndex: item.chapterIndex,
+                        paragraphIndex: item.paragraphIndex,
+                        text: item.text,
+                    })),
+                    existing,
+                    companionId,
+                ),
+                readingConfig.annotationRetryCount > 0 ? readingConfig.annotationRetryCount : 0,
             );
 
             generatedBatchesRef.current.add(batchKey);
@@ -747,13 +885,17 @@ export function ReadingViewer({ book, onBack }: Props) {
             } else {
                 setAnnotationError("AI 没有返回批注（可能返回了[无批注]或API调用失败）");
             }
+            return true;
         } catch (err) {
             console.error("[Reading] Annotation error:", err);
             setAnnotationError(`批注失败: ${err instanceof Error ? err.message : String(err)}`);
+            return false;
         } finally {
+            inFlightBatchesRef.current.delete(batchKey);
+            annotationInFlightRef.current = false;
             setGenerating(false);
         }
-    }, [book, companionId, generating, loadExistingAnnotationsForItems]);
+    }, [book, companionId, loadExistingAnnotationsForItems, readingConfig.annotationRetryCount]);
 
     const openAnnotationDialog = (mode: AnnotationDialogMode) => {
         const nextSize = annotationBatchSize || (isPdf ? 5 : 50);
@@ -775,13 +917,9 @@ export function ReadingViewer({ book, onBack }: Props) {
             }
             setAutoAnnotate(true);
             generatedBatchesRef.current.clear();
-            autoBootstrapInFlightRef.current = true;
-            try {
-                const request = await materializeBatchRequest(size, "auto-current");
-                if (request) await executeBatchAnnotation(request);
-            } finally {
-                autoBootstrapInFlightRef.current = false;
-            }
+            prefetchedBatchStartRef.current = -1; // 新的阅读体验：预生成触发标记一并重置
+            const request = await materializeBatchRequest(size, "auto-current");
+            if (request) await executeBatchAnnotation(request);
             return;
         }
 
@@ -790,6 +928,54 @@ export function ReadingViewer({ book, onBack }: Props) {
         if (!request) return;
         generatedBatchesRef.current.delete(`${book.id}:${companionId || ""}:${request.key}`);
         await executeBatchAnnotation(request, { force: true });
+    };
+
+    /** 打开手动预批注对话框：默认预生成「当前页起一个批次」的范围 */
+    const openPdfPrefetchDialog = () => {
+        const start = Math.max(1, pdfCurrentPage || 1);
+        const batch = Math.max(1, annotationBatchSize || 5);
+        const end = Math.min(pdfTotalPages || (start + batch - 1), start + batch - 1);
+        setAnnotationError(null);
+        setPdfPrefetchStartInput(String(start));
+        setPdfPrefetchEndInput(String(end));
+        setPdfPrefetchDialogOpen(true);
+    };
+
+    /** 手动预批注：按用户自定义的页码范围，预解析文本层并立即生成批注 */
+    const handlePdfManualPrefetch = async () => {
+        if (!companionId) {
+            setAnnotationError("请先选择共读角色");
+            return;
+        }
+        const total = Math.max(1, pdfTotalPages || 1);
+        const start = Math.max(1, Math.min(total, Math.round(Number(pdfPrefetchStartInput) || 1)));
+        const end = Math.max(start, Math.min(total, Math.round(Number(pdfPrefetchEndInput) || start)));
+        if (end - start + 1 > MAX_MANUAL_PDF_PREFETCH_PAGES) {
+            setAnnotationError(`一次最多预批注 ${MAX_MANUAL_PDF_PREFETCH_PAGES} 页，请缩小页码范围`);
+            return;
+        }
+        setAnnotationError(null);
+        setPdfPrefetchDialogOpen(false);
+        try {
+            // 预解析指定范围的文本层（渲染已解耦，不会重建页面）
+            const merged = await ensurePdfPageRangeParsed(start, end);
+            const refs = buildParagraphRefsFromChapters(merged);
+            const items = refs.filter((item) => (item.pageNum || 0) >= start && (item.pageNum || 0) <= end && item.text.trim());
+            if (items.length === 0) {
+                setAnnotationError("所选范围没有可批注的文本");
+                return;
+            }
+            const request: AnnotationBatchRequest = {
+                key: `pdf:${start}:${end}:manual`,
+                title: `第${start}-${end}页`,
+                size: end - start + 1,
+                items,
+            };
+            await executeBatchAnnotation(request, { force: true });
+        } catch (err) {
+            console.error("[Reading] PDF manual prefetch error:", err);
+            setAnnotationError(`预批注失败: ${err instanceof Error ? err.message : String(err)}`);
+        }
     };
 
     const openNavigationDialog = () => {
@@ -890,10 +1076,35 @@ export function ReadingViewer({ book, onBack }: Props) {
         }
     }, [showChat, chatExpanded]);
 
+    // 共读讨论悬浮窗展开时自动滚动到最新消息。
+    // 仅在「打开」时滚动一次、无持续吸附——用户随后自由滑动即可打断，不会被拉回。
+    useEffect(() => {
+        if (!showChat || !chatExpanded) return;
+        if (readingConfig.chatAutoScrollOnOpen === false) return;
+        const el = chatListRef.current;
+        if (!el) return;
+        let raf1 = 0;
+        let raf2 = 0;
+        // 等展开动画与内容渲染稳定后再滚到底
+        raf1 = window.requestAnimationFrame(() => {
+            raf2 = window.requestAnimationFrame(() => {
+                el.scrollTop = el.scrollHeight;
+            });
+        });
+        return () => {
+            window.cancelAnimationFrame(raf1);
+            window.cancelAnimationFrame(raf2);
+        };
+    }, [showChat, chatExpanded, readingConfig.chatAutoScrollOnOpen]);
+
     const handleDeleteReadingAnnotation = useCallback(async (annotationId: string) => {
         await deleteAnnotation(annotationId);
         setAnnotations((prev) => prev.filter((annotation) => annotation.id !== annotationId));
         setActiveAnnotationId(null);
+    }, []);
+
+    const handlePdfJumpComplete = useCallback(() => {
+        setPdfJumpPage(undefined);
     }, []);
 
     const handleNavChapterClick = (index: number) => {
@@ -921,10 +1132,15 @@ export function ReadingViewer({ book, onBack }: Props) {
             const pageFraction = Math.max(0, Math.min(1, rawPosition - targetChapterIndex));
 
             if (targetChapterIndex === chapterIndex) {
-                pendingTxtPageFractionRef.current = null;
-                setTxtPage(Math.round(pageFraction * Math.max(0, txtTotalPages - 1)));
+                if (isScrollMode) {
+                    scrollToChapterFraction(pageFraction, chapterIndex);
+                } else {
+                    pendingTxtPageFractionRef.current = null;
+                    setTxtPage(Math.round(pageFraction * Math.max(0, txtTotalPages - 1)));
+                }
             } else {
                 pendingTxtPageFractionRef.current = pageFraction;
+                pendingScrollFractionRef.current = pageFraction;
                 setChapterIndex(targetChapterIndex);
                 setTxtPage(0);
             }
@@ -941,7 +1157,7 @@ export function ReadingViewer({ book, onBack }: Props) {
             return;
         }
 
-        if (!isPdf && currentChapter) {
+        if (!isPdf && !isScrollMode && currentChapter) {
             const rect = (e.currentTarget as HTMLElement).getBoundingClientRect();
             const x = e.clientX - rect.left;
             const w = rect.width;
@@ -953,7 +1169,10 @@ export function ReadingViewer({ book, onBack }: Props) {
     };
 
     useEffect(() => {
-        if (!autoAnnotate || generating || !companionId || autoBootstrapInFlightRef.current) return;
+        // 自动批注：跟随阅读位置推进，为当前批生成批注。
+        // 与开启时的 bootstrap 并发时由 executeBatchAnnotation 的同步锁去重；
+        // 若 bootstrap 未拿到批次（书刚打开数据未就绪），本 effect 会随阅读位置变化持续兜底触发。
+        if (!autoAnnotate || generating || !companionId) return;
         void (async () => {
             const request = await materializeBatchRequest(annotationBatchSize, "auto");
             if (!request) return;
@@ -961,22 +1180,121 @@ export function ReadingViewer({ book, onBack }: Props) {
         })();
     }, [annotationBatchSize, autoAnnotate, companionId, executeBatchAnnotation, generating, materializeBatchRequest]);
 
+    // 批注预生成：当前批注批读到用户设置的阈值时，提前生成下一批，
+    // 把生成时间差放在用户读上一批批注的时间里，避免用户读到下一批时批注还没生成完。不会重复批注（批次按 key 去重）。
+    // TXT 按「段落」分批次（autoAnnotatePrefetch 控制）；PDF 按「页数」分批次（autoAnnotatePrefetchPdf 控制），
+    // 两者各自独立开关，批次大小统一跟随自动批注的 annotationBatchSize。
+    const prefetchedBatchStartRef = useRef(-1);
     useEffect(() => {
-        if (!isPdf || pdfCurrentPage <= 0 || chapters.length === 0) return;
+        if (!autoAnnotate) { prefetchedBatchStartRef.current = -1; return; }
+        if (!companionId || generating) return;
+        const size = Math.max(1, annotationBatchSize || (isPdf ? 5 : 50));
+        const threshold = Math.max(0, Math.min(1, readingConfig.annotationPrefetchThreshold ?? 2 / 3));
+
+        if (isPdf) {
+            // PDF 预批注开关：关闭时不预生成
+            if (!readingConfig.autoAnnotatePrefetchPdf) { prefetchedBatchStartRef.current = -1; return; }
+            // PDF：按页分批次。当前页所在批次读到阈值时，预解析并预生成下一批批注。
+            if (pdfTotalPages <= 0) return;
+            const batchStartPage = Math.floor((pdfCurrentPage - 1) / size) * size + 1;
+            const offsetInBatch = pdfCurrentPage - batchStartPage; // 0-based
+            if ((offsetInBatch + 1) / size < threshold) return; // 本批还没读到阈值
+            if (prefetchedBatchStartRef.current === batchStartPage) return;
+            prefetchedBatchStartRef.current = batchStartPage;
+
+            const nextStartPage = batchStartPage + size;
+            if (nextStartPage > pdfTotalPages) return;
+            const nextEndPage = Math.min(nextStartPage + size - 1, pdfTotalPages);
+            void (async () => {
+                try {
+                    // 预解析下一批文本层（解析后 setChapters，但渲染已与文本层解耦，不会重建页面）
+                    const merged = await ensurePdfPageRangeParsed(nextStartPage, nextEndPage);
+                    const refs = buildParagraphRefsFromChapters(merged);
+                    const items = refs.filter((item) => (item.pageNum || 0) >= nextStartPage && (item.pageNum || 0) <= nextEndPage && item.text.trim());
+                    if (items.length === 0) { prefetchedBatchStartRef.current = -1; return; }
+                    const request: AnnotationBatchRequest = {
+                        key: `pdf:${nextStartPage}:${size}`,
+                        title: `第${nextStartPage}-${nextEndPage}页`,
+                        size,
+                        items,
+                    };
+                    // 若被跳过，重置标记让下一轮滚动再试，避免预生成丢失
+                    void executeBatchAnnotation(request).then((started) => {
+                        if (!started) prefetchedBatchStartRef.current = -1;
+                    });
+                } catch (err) {
+                    console.error("[Reading] PDF prefetch error:", err);
+                    prefetchedBatchStartRef.current = -1;
+                }
+            })();
+            return;
+        }
+
+        // TXT 预批注开关：关闭时不预生成
+        if (!readingConfig.autoAnnotatePrefetch) { prefetchedBatchStartRef.current = -1; return; }
+
+        // TXT：当前阅读位置 → 全书记绝对段落索引
+        if (paragraphRefs.length === 0) return;
+        let currentAbs = -1;
+        if (isScrollMode) {
+            const chapterRefs = paragraphRefs.filter((item) => item.chapterIndex === chapterIndex && item.text.trim());
+            if (chapterRefs.length > 0) {
+                const center = Math.round(Math.max(0, Math.min(1, scrollFraction)) * (chapterRefs.length - 1));
+                currentAbs = chapterRefs[center].absoluteIndex;
+            }
+        } else {
+            const pageItems = txtPages[txtPage] || [];
+            const firstLine = pageItems.find((item): item is Extract<TxtPageItem, { kind: "line" }> => item.kind === "line");
+            if (firstLine) {
+                const ref = paragraphRefs.find((r) => r.chapterIndex === firstLine.chapterIndex && r.paragraphIndex === firstLine.paragraphIndex);
+                if (ref) currentAbs = ref.absoluteIndex;
+            }
+        }
+        if (currentAbs < 0) return;
+
+        const batchStart = Math.floor(currentAbs / size) * size;
+        if ((currentAbs - batchStart + 1) / size < threshold) return; // 本批还没读到用户设置的阈值
+        if (prefetchedBatchStartRef.current === batchStart) return;       // 本批已触发过预生成
+        prefetchedBatchStartRef.current = batchStart;
+
+        const nextStart = batchStart + size;
+        if (nextStart >= paragraphRefs.length) return;
+        const items = paragraphRefs.slice(nextStart, nextStart + size).filter((item) => item.text.trim());
+        if (items.length === 0) return;
+
+        const request: AnnotationBatchRequest = {
+            key: `txt:${nextStart}:${size}`,
+            title: `第${items[0].absoluteIndex + 1}-${items[items.length - 1].absoluteIndex + 1}段`,
+            size,
+            items,
+        };
+        // 若被跳过（自动批注正在生成/该批已生成），重置标记让下一轮滚动再试，避免预生成丢失
+        void executeBatchAnnotation(request).then((started) => {
+            if (!started) prefetchedBatchStartRef.current = -1;
+        });
+    }, [annotationBatchSize, autoAnnotate, chapterIndex, companionId, ensurePdfPageRangeParsed, executeBatchAnnotation, generating, isPdf, isScrollMode, paragraphRefs, pdfCurrentPage, pdfTotalPages, readingConfig.autoAnnotatePrefetch, readingConfig.autoAnnotatePrefetchPdf, readingConfig.annotationPrefetchThreshold, scrollFraction, txtPage, txtPages]);
+
+    useEffect(() => {
+        // 自动批注开启时，随滚动把当前 5 页的文本层预先解析好，让批注生成请求不用临时等待解析。
+        // 手动写批注 / 共读讨论内部会自行 ensurePdfPageRangeParsed，关闭自动批注时纯阅读不预解析。
+        // 渲染已与文本层解耦：此处 setChapters 只会触发批注钉局部更新，不会重建页面，无闪烁。
+        if (!isPdf || !autoAnnotate || pdfCurrentPage <= 0 || chapters.length === 0) return;
         const chunkStart = Math.floor((pdfCurrentPage - 1) / PDF_PAGES_PER_CHAPTER) * PDF_PAGES_PER_CHAPTER + 1;
         const chunkEnd = Math.min(chunkStart + PDF_PAGES_PER_CHAPTER - 1, pdfTotalPages || chunkStart + PDF_PAGES_PER_CHAPTER - 1);
         void ensurePdfPageRangeParsed(chunkStart, chunkEnd).catch((err) => {
             console.error("[Reading] PDF lazy parse error:", err);
         });
-    }, [chapters.length, ensurePdfPageRangeParsed, isPdf, pdfCurrentPage, pdfTotalPages]);
+    }, [autoAnnotate, chapters.length, ensurePdfPageRangeParsed, isPdf, pdfCurrentPage, pdfTotalPages]);
 
     // Chapter navigation
     const goToChapter = (idx: number, startFromEnd = false) => {
         if (idx < 0 || idx >= chapters.length) return;
         pendingTxtPageFractionRef.current = startFromEnd ? 1 : null;
+        // 滚动模式：显式跳章后定位到新章节的起点（0）或终点（1），而非窗口顶部（可能是上一章）
+        // 实际滚动位置由渲染后的 useLayoutEffect 依据章节块度量换算
+        pendingScrollFractionRef.current = startFromEnd ? 1 : 0;
         setChapterIndex(idx);
         setTxtPage(0);
-        scrollRef.current?.scrollTo(0, 0);
     };
 
     const buildDiscussContext = useCallback((sourceChapters: BookChapter[] = chapters): ReadingDiscussContext | null => {
@@ -1010,6 +1328,15 @@ export function ReadingViewer({ book, onBack }: Props) {
                     .filter((item) => item.chapterIndex === focusChapterIndex)
                     .map((item) => item.paragraphIndex),
             )].sort((a, b) => a - b);
+        } else if (isScrollMode) {
+            // 滚动模式没有分页：以当前滚动比例估算正在阅读的段落窗口
+            const chapterRefs0 = sourceParagraphRefs.filter((item) => item.chapterIndex === focusChapterIndex && item.text.trim());
+            if (chapterRefs0.length === 0) return null;
+            const center = Math.round(Math.max(0, Math.min(1, scrollFraction)) * (chapterRefs0.length - 1));
+            const half = Math.max(1, Math.ceil(DISCUSS_MAX_PARAGRAPHS / 3));
+            focusParagraphIndexes = chapterRefs0
+                .slice(Math.max(0, center - half), Math.min(chapterRefs0.length, center + half + 1))
+                .map((item) => item.paragraphIndex);
         } else {
             const pageItems = txtPages[txtPage] || [];
             focusParagraphIndexes = [...new Set(
@@ -1074,7 +1401,7 @@ export function ReadingViewer({ book, onBack }: Props) {
             chapterContent,
             annotations: contextAnnotations,
         };
-    }, [annotations, book.title, chapterIndex, chapters, currentChapter?.title, isPdf, pdfCurrentPage, txtPage, txtPages]);
+    }, [annotations, book.title, chapterIndex, chapters, currentChapter?.title, isPdf, isScrollMode, pdfCurrentPage, scrollFraction, txtPage, txtPages]);
 
     // Chat send — parse AI response like chat-room does
     const handleSend = async () => {
@@ -1212,8 +1539,10 @@ export function ReadingViewer({ book, onBack }: Props) {
 
     const handleChatDragStart = (e: React.PointerEvent<HTMLElement>) => {
         if (e.pointerType === "mouse" && e.button !== 0) return;
-        // Don't hijack the message list scroll or the input — only drag from the chrome.
-        if ((e.target as HTMLElement).closest("button, input, textarea, select, a, .reading-chat-float-body, .reading-char-picker")) return;
+        // 悬浮球自身就是一个 button，点击与拖拽靠 chatMovedRef 区分，必须允许拖拽；
+        // 悬浮条/窗内部的交互元素（按钮/输入框/正文滚动区等）不参与拖拽，避免抢占点击。
+        const target = e.target as HTMLElement;
+        if (!target.closest(".reading-chat-launch") && target.closest("button, input, textarea, select, a, .reading-chat-float-body, .reading-char-picker")) return;
         setIsDragging(true);
         chatDragRef.current = {
             pointerId: e.pointerId,
@@ -1236,9 +1565,78 @@ export function ReadingViewer({ book, onBack }: Props) {
             chatMovedRef.current = true;
         }
         if (chatMovedRef.current) {
-            setChatOffset({ x: nextX, y: nextY });
+            // 拖拽过程中就约束在屏幕内，悬浮元素永不滑出屏幕外
+            setChatOffset(clampChatOffset({ x: nextX, y: nextY }));
         }
     };
+
+    // 悬浮元素尺寸（按当前形态估算，用于边界约束/贴边吸附）
+    const getChatFloatSize = () => {
+        const w = window.innerWidth;
+        const h = window.innerHeight;
+        if (!showChat) return { width: 56, height: 56 };                                    // 悬浮球
+        if (!chatExpanded) return { width: Math.min(280, w - CHAT_FLOAT_MARGIN * 2), height: 56 }; // 悬浮条
+        return { width: Math.min(300, w - CHAT_FLOAT_MARGIN * 2), height: Math.min(380, h * 0.55) }; // 悬浮窗
+    };
+
+    // 把偏移量约束在可视范围内。CSS 基础位置为 left:12px / bottom:12px，
+    // 偏移是相对该基础位置的 translate3d，正 Y 向下。
+    const clampChatOffset = (offset: { x: number; y: number }): { x: number; y: number } => {
+        const { width, height } = getChatFloatSize();
+        const w = window.innerWidth;
+        const h = window.innerHeight;
+        const maxX = w - CHAT_FLOAT_MARGIN * 2 - width;
+        const maxY = height + CHAT_FLOAT_MARGIN * 2 - h; // 允许向上拖到接近顶边（负值表示可上移）
+        return {
+            x: Math.max(0, Math.min(maxX, offset.x)),
+            y: Math.max(maxY, Math.min(0, offset.y)),
+        };
+    };
+
+    const persistChatFloatPos = (offset: { x: number; y: number }) => {
+        try {
+            localStorage.setItem(CHAT_FLOAT_POS_KEY, JSON.stringify(clampChatOffset(offset)));
+        } catch {
+            // ignore storage errors
+        }
+    };
+
+    // 悬浮形态切换（球→条→窗 / 收起）后把位置约束回可视范围，防止越界丢失
+    useEffect(() => {
+        setChatOffset((prev) => {
+            const clamped = clampChatOffset(prev);
+            return clamped.x === prev.x && clamped.y === prev.y ? prev : clamped;
+        });
+        // eslint-disable-next-line react-hooks/exhaustive-deps
+    }, [showChat, chatExpanded]);
+
+    // 始终指向最新版本的 clampChatOffset（供一次性挂载的监听器使用）
+    const clampChatOffsetRef = useRef(clampChatOffset);
+    clampChatOffsetRef.current = clampChatOffset;
+
+    // 窗口尺寸变化（旋转/分屏）后把悬浮元素约束回屏幕内；书架设置里的「重置位置」事件
+    useEffect(() => {
+        const onResize = () => {
+            setChatOffset((prev) => {
+                const clamped = clampChatOffsetRef.current(prev);
+                return clamped.x === prev.x && clamped.y === prev.y ? prev : clamped;
+            });
+        };
+        const onResetPos = () => {
+            setChatOffset({ x: 0, y: 0 });
+            try {
+                localStorage.setItem(CHAT_FLOAT_POS_KEY, JSON.stringify({ x: 0, y: 0 }));
+            } catch {
+                // ignore storage errors
+            }
+        };
+        window.addEventListener("resize", onResize);
+        window.addEventListener("reading-chat-float-reset", onResetPos);
+        return () => {
+            window.removeEventListener("resize", onResize);
+            window.removeEventListener("reading-chat-float-reset", onResetPos);
+        };
+    }, []);
 
     const handleChatDragEnd = (e: React.PointerEvent<HTMLElement>) => {
         const drag = chatDragRef.current;
@@ -1247,37 +1645,24 @@ export function ReadingViewer({ book, onBack }: Props) {
         e.currentTarget.releasePointerCapture?.(e.pointerId);
         setIsDragging(false);
 
-        // Snap to edges horizontally if not expanded, or bound within screen
-        const marginX = 12; // left/right margin defined in CSS
-        const marginY = 12; // bottom margin
-        const w = window.innerWidth;
-        const h = window.innerHeight;
-
-        let targetX = chatOffset.x;
-        let targetY = chatOffset.y;
-
-        // Keep inside bounds roughly
-        // If not expanded, we might want to snap to left or right edge.
-        // For simplicity, just bound it inside the screen so it doesn't get lost
-        const elWidth = chatExpanded ? 300 : Math.min(260, w - 64);
-        const elHeight = chatExpanded ? 380 : 56;
-
-        // Original CSS positions it at left: 12px, bottom: 12px
-        // So default position is (0,0) offset from that.
-        // Screen bounds for offset:
-        const minX = -marginX; // touch left edge
-        const maxX = w - elWidth - marginX; // touch right edge
-        const maxY = h - elHeight - marginY - 60; // 60 for safe area approx
-        const minY = -marginY - 120; // Some upper bound
-
-        targetX = Math.max(minX, Math.min(targetX, maxX));
-        // Only apply strict Y bounding if it goes way out of bounds
-        // Since Y is from bottom, positive Y goes up, negative Y goes down
-        // Wait, translate3d positive Y goes DOWN visually.
-        // We'll just do a light bounding to ensure it doesn't disappear.
-        if (targetX !== chatOffset.x || targetY !== chatOffset.y) {
-            setChatOffset({ x: targetX, y: chatOffset.y });
+        // 纯点击（没拖动）不吸附、不改位置
+        if (!chatMovedRef.current) {
+            chatMovedRef.current = false;
+            return;
         }
+        chatMovedRef.current = false;
+
+        let target = clampChatOffset({ x: chatOffset.x, y: chatOffset.y });
+        if (!chatExpanded) {
+            // 悬浮球/悬浮条：横向吸附到最近的边缘（贴左或贴右）
+            const { width } = getChatFloatSize();
+            const maxX = window.innerWidth - CHAT_FLOAT_MARGIN * 2 - width;
+            const leftDist = target.x;
+            const rightDist = maxX - target.x;
+            target = { x: leftDist <= rightDist ? 0 : maxX, y: target.y };
+        }
+        setChatOffset(target);
+        persistChatFloatPos(target);
     };
 
     const handleChatLaunchClick = () => {
@@ -1316,8 +1701,9 @@ export function ReadingViewer({ book, onBack }: Props) {
     }, [annotations, chapterIndex, currentChapter, isPdf]);
 
     // TXT pagination — split by actual rendered width/height so each page fits one screen.
+    // 滚动模式下不参与分页，直接渲染整章内容。
     useEffect(() => {
-        if (isPdf || !currentChapter || !scrollRef.current || !txtMeasureLineRef.current || !txtMeasureGapRef.current || !txtMeasureAnnotationRef.current) {
+        if (isPdf || isScrollMode || !currentChapter || !scrollRef.current || !txtMeasureLineRef.current || !txtMeasureGapRef.current || !txtMeasureAnnotationRef.current) {
             setTxtPages([]);
             return;
         }
@@ -1445,7 +1831,7 @@ export function ReadingViewer({ book, onBack }: Props) {
 
         lastTxtPaginationSignatureRef.current = paginationSignature;
         setTxtPages(pages);
-    }, [annotations, bilingualTranslationEnabled, chapterIndex, currentChapter, isAnnotationTranslationExpanded, isPdf, txtLayoutVersion]);
+    }, [annotations, bilingualTranslationEnabled, chapterIndex, currentChapter, isAnnotationTranslationExpanded, isPdf, isScrollMode, txtLayoutVersion]);
 
     const txtTotalPages = txtPagesReadyForCurrentChapter ? txtPages.length : 1;
 
@@ -1476,48 +1862,187 @@ export function ReadingViewer({ book, onBack }: Props) {
     const txtBookSliderValue = (() => {
         if (chapters.length === 0) return 1;
         const boundedChapterIndex = Math.max(0, Math.min(chapters.length - 1, chapterIndex));
-        const boundedTxtPage = Math.max(0, Math.min(txtPage, txtTotalPages - 1));
-        const pageFraction = txtTotalPages > 1 ? boundedTxtPage / (txtTotalPages - 1) : 0;
+        const pageFraction = isScrollMode
+            ? Math.max(0, Math.min(1, scrollFraction))
+            : (txtTotalPages > 1 ? Math.max(0, Math.min(txtPage, txtTotalPages - 1)) / (txtTotalPages - 1) : 0);
         return Math.max(1, Math.min(txtBookSliderMax, boundedChapterIndex + 1 + pageFraction));
     })();
     useEffect(() => {
-        if (isPdf) return;
+        if (isPdf || isScrollMode) return;
         const pendingFraction = pendingTxtPageFractionRef.current;
         if (pendingFraction === null || txtPagesChapterIndex !== chapterIndex) return;
 
         setTxtPage(Math.round(pendingFraction * Math.max(0, txtTotalPages - 1)));
         pendingTxtPageFractionRef.current = null;
-    }, [chapterIndex, isPdf, txtPagesChapterIndex, txtTotalPages]);
+    }, [chapterIndex, isPdf, isScrollMode, txtPagesChapterIndex, txtTotalPages]);
 
     useEffect(() => {
-        if (chapters.length === 0) return;
+        if (!chaptersLoaded || chapters.length === 0) return;
 
-        const chapterPageCurrent = Math.max(1, txtPage + 1);
-        const chapterPageTotal = Math.max(1, txtTotalPages);
-        const progressFraction = isPdf
-            ? (pdfTotalPages > 0 ? Math.min(1, Math.max(0, pdfCurrentPage / pdfTotalPages)) : 0)
-            : Math.min(1, Math.max(0, (chapterIndex + chapterPageCurrent / chapterPageTotal) / Math.max(1, chapters.length)));
+        let scrollPosition: number;
+        let progressFraction: number;
+        let progressCurrent: number;
+        let progressTotal: number;
+        let progressScope: "book" | "chapter";
+        if (isPdf) {
+            scrollPosition = Math.max(0, pdfCurrentPage - 1);
+            progressFraction = pdfTotalPages > 0 ? Math.min(1, Math.max(0, pdfCurrentPage / pdfTotalPages)) : 0;
+            progressCurrent = Math.max(1, pdfCurrentPage);
+            progressTotal = Math.max(1, pdfTotalPages || 1);
+            progressScope = "book";
+        } else if (isScrollMode) {
+            const fraction = Math.max(0, Math.min(1, scrollFraction));
+            scrollPosition = fraction;
+            progressFraction = Math.min(1, Math.max(0, (chapterIndex + fraction) / Math.max(1, chapters.length)));
+            progressCurrent = Math.max(1, Math.round(fraction * 100));
+            progressTotal = 100;
+            progressScope = "chapter";
+        } else {
+            const chapterPageCurrent = Math.max(1, txtPage + 1);
+            const chapterPageTotal = Math.max(1, txtTotalPages);
+            scrollPosition = txtPage;
+            progressFraction = Math.min(1, Math.max(0, (chapterIndex + chapterPageCurrent / chapterPageTotal) / Math.max(1, chapters.length)));
+            progressCurrent = chapterPageCurrent;
+            progressTotal = chapterPageTotal;
+            progressScope = "chapter";
+        }
 
         const progress: ReadingProgress = {
             bookId: book.id,
             chapterIndex,
-            scrollPosition: isPdf ? Math.max(0, pdfCurrentPage - 1) : txtPage,
+            scrollPosition,
             companionCharacterId: companionId || undefined,
             progressFraction,
-            progressCurrent: isPdf ? Math.max(1, pdfCurrentPage) : chapterPageCurrent,
-            progressTotal: isPdf ? Math.max(1, pdfTotalPages || 1) : chapterPageTotal,
-            progressScope: isPdf ? "book" : "chapter",
+            progressCurrent,
+            progressTotal,
+            progressScope,
+            readingMode: isPdf ? undefined : (isScrollMode ? "scroll" : "page"),
             lastReadAt: new Date().toISOString(),
         };
         saveProgress(progress);
-    }, [book.id, chapterIndex, chapters.length, companionId, isPdf, pdfCurrentPage, pdfTotalPages, txtPage, txtTotalPages]);
+    }, [book.id, chapterIndex, chapters.length, chaptersLoaded, companionId, isPdf, isScrollMode, pdfCurrentPage, pdfTotalPages, scrollFraction, txtPage, txtTotalPages]);
 
     useEffect(() => {
         setTxtPage((prev) => Math.min(prev, Math.max(0, txtTotalPages - 1)));
     }, [txtTotalPages]);
 
-    // Scroll to top when page changes
-    useEffect(() => { scrollRef.current?.scrollTo(0, 0); }, [txtPage]);
+    // Scroll to top when page changes (仅翻页模式；滚动模式的位置由 useLayoutEffect 统一管理)
+    useEffect(() => {
+        if (isScrollMode) return;
+        scrollRef.current?.scrollTo(0, 0);
+    }, [txtPage, isScrollMode]);
+
+    // 滚动模式：监听滚动 —— 更新章节内滚动比例；无缝衔接（多章窗口平移，保持视觉连续）
+    // 前向：当前章内容读完（章底滚到视口顶部/底部）→ 移除顶部章块 + 补偿滚动位置，自然过渡到下一章
+    // 后向：滚到窗口顶部 → 顶部前插上一章块 + 补偿滚动位置，自然回到上一章（无需「上一章」按钮）
+    useEffect(() => {
+        if (!isScrollMode) return;
+        const body = scrollRef.current;
+        if (!body) return;
+        let rafId = 0;
+        const onScroll = () => {
+            if (rafId) return;
+            rafId = window.requestAnimationFrame(() => {
+                rafId = 0;
+                const ci = chapterIndexRef.current;
+                const len = chaptersLenRef.current;
+                const viewport = body.clientHeight;
+                const maxScroll = Math.max(0, body.scrollHeight - viewport);
+                const metrics = chapterMetricsRef.current.get(ci);
+                let fraction = 0;
+                if (metrics) {
+                    const span = Math.max(1, metrics.height - viewport);
+                    fraction = Math.min(1, Math.max(0, (body.scrollTop - metrics.top) / span));
+                } else {
+                    fraction = maxScroll > 0 ? Math.min(1, Math.max(0, body.scrollTop / maxScroll)) : 0;
+                }
+                scrollFractionRef.current = fraction;
+                setScrollFraction(fraction);
+                if (!metrics) return;
+
+                // 离开顶部后解除平移冷却
+                if (body.scrollTop > 2) shiftCooldownRef.current = false;
+
+                const bottom = metrics.top + metrics.height;
+                // 高章节（超一屏）：章底滚到视口底部即衔接下一章，header 同步更新；
+                // 矮章节（不足一屏）：等章底滚到视口顶部再衔接，避免移除顶部章块后滚动位置为负导致跳动
+                const triggerAt = metrics.height >= viewport ? bottom - viewport - 2 : bottom - 2;
+                // 前向：当前章已读完 → 移除顶部章块，窗口后移
+                if (!shiftCooldownRef.current && ci < len - 1 && body.scrollTop >= triggerAt) {
+                    shiftCooldownRef.current = true;
+                    const prevMetrics = chapterMetricsRef.current.get(ci - 1);
+                    pendingScrollActionRef.current = {
+                        kind: "shift-forward",
+                        oldScrollTop: body.scrollTop,
+                        removedHeight: prevMetrics ? prevMetrics.height : 0,
+                    };
+                    setChapterIndex(ci + 1);
+                    return;
+                }
+                // 后向：已滚到窗口顶部 → 顶部前插上一章块，窗口前移
+                if (!shiftCooldownRef.current && ci > 0 && body.scrollTop <= 2) {
+                    shiftCooldownRef.current = true;
+                    pendingScrollActionRef.current = { kind: "shift-backward", oldScrollTop: body.scrollTop };
+                    setChapterIndex(ci - 1);
+                    return;
+                }
+            });
+        };
+        body.addEventListener("scroll", onScroll, { passive: true });
+        return () => {
+            body.removeEventListener("scroll", onScroll);
+            if (rafId) window.cancelAnimationFrame(rafId);
+        };
+    }, [isScrollMode]);
+
+    // 滚动模式：渲染后测量各章块位置，并应用窗口平移补偿 / 显式定位（useLayoutEffect 保证在绘制前执行，无闪跳）
+    useLayoutEffect(() => {
+        if (!isScrollMode || !chaptersLoaded) return;
+        const content = scrollContentRef.current;
+        const body = scrollRef.current;
+        if (!content || !body || windowChapters.length === 0) return;
+
+        // 1. 测量窗口内各章块在滚动坐标系中的位置（top 与 body.scrollTop 同坐标系）
+        const bodyRect = body.getBoundingClientRect();
+        const metrics = new Map<number, { top: number; height: number }>();
+        for (const chunk of content.querySelectorAll<HTMLElement>("[data-chapter-index]")) {
+            const idx = Number(chunk.getAttribute("data-chapter-index"));
+            if (!Number.isFinite(idx)) continue;
+            const rect = chunk.getBoundingClientRect();
+            metrics.set(idx, { top: rect.top - bodyRect.top + body.scrollTop, height: rect.height });
+        }
+        chapterMetricsRef.current = metrics;
+
+        // 2. 窗口平移补偿（保持视觉位置不动，实现无缝衔接）
+        const action = pendingScrollActionRef.current;
+        if (action) {
+            pendingScrollActionRef.current = null;
+            if (action.kind === "shift-forward") {
+                body.scrollTop = Math.max(0, action.oldScrollTop - action.removedHeight);
+            } else {
+                const newPrev = metrics.get(chapterIndex - 1);
+                body.scrollTop = Math.max(0, action.oldScrollTop + (newPrev ? newPrev.height : 0));
+            }
+            return;
+        }
+
+        // 3. 显式跳章 / 打开恢复 / 默认定位到当前章起点
+        const positionKey = `${book.id}:${isScrollMode}`;
+        const pendingFraction = pendingScrollFractionRef.current;
+        const initialFraction = initialScrollFractionRef.current;
+        if (pendingFraction !== null) {
+            pendingScrollFractionRef.current = null;
+            scrollPositionedKeyRef.current = positionKey;
+            scrollToChapterFraction(pendingFraction, chapterIndex);
+        } else if (initialFraction !== null) {
+            initialScrollFractionRef.current = null;
+            scrollPositionedKeyRef.current = positionKey;
+            scrollToChapterFraction(initialFraction, chapterIndex);
+        } else if (scrollPositionedKeyRef.current !== positionKey) {
+            scrollPositionedKeyRef.current = positionKey;
+            scrollToChapterFraction(0, chapterIndex);
+        }
+    }, [isScrollMode, chapterIndex, windowChapters, chaptersLoaded, annotations, txtLayoutVersion, book.id]);
 
     // Swipe handlers for TXT
     const handleTouchStart = (e: React.TouchEvent) => {
@@ -1535,6 +2060,27 @@ export function ReadingViewer({ book, onBack }: Props) {
     const activeReadingMenuMessage = readingMessageMenu
         ? chatMessages.find((msg) => msg.id === readingMessageMenu.messageId) || null
         : null;
+
+    /** PDF 渲染设置先在弹窗内暂存，确认时只重建一次，避免拖动滑块期间连续重渲染整本 PDF。 */
+    const openReadingSettings = () => {
+        setPdfRenderDraft({
+            pdfZoom: readingConfig.pdfZoom ?? 1,
+            pdfPreloadRadius: readingConfig.pdfPreloadRadius ?? 3,
+            pdfPreloadEnabled: readingConfig.pdfPreloadEnabled !== false,
+        });
+        setShowReadingSettings(true);
+    };
+
+    const handleReadingSettingsConfirm = () => {
+        if (isPdf) {
+            setReadingConfig((prev) => {
+                const next = { ...prev, ...pdfRenderDraft };
+                saveReadingInteractionConfig(next);
+                return next;
+            });
+        }
+        setShowReadingSettings(false);
+    };
 
     return (
         <div className="reading-app-surface absolute inset-0 z-[100] flex flex-col bg-[var(--c-page-body-bg)]" data-immersive={immersive} style={{ paddingTop: "var(--page-header-safe-top, 48px)" }}>
@@ -1600,7 +2146,7 @@ export function ReadingViewer({ book, onBack }: Props) {
                             <div
                                 key={c.characterId}
                                 className="chat-contact-item"
-                                onClick={() => { setCompanionId(c.characterId); closeCharPicker(); generatedBatchesRef.current.clear(); }}
+                                onClick={() => { setCompanionId(c.characterId); closeCharPicker(); generatedBatchesRef.current.clear(); prefetchedBatchStartRef.current = -1; }}
                             >
                                 <div className="chat-contact-avatar"
                                     style={companionId === c.characterId ? { outline: "3px solid var(--c-success)", outlineOffset: "2px" } : undefined}
@@ -1617,7 +2163,7 @@ export function ReadingViewer({ book, onBack }: Props) {
             {/* Reading content */}
             <div
                 ref={scrollRef}
-                className={`relative flex-1 min-h-0 px-4 pt-1 pb-3 ${isPdf ? "overflow-auto" : "overflow-hidden"}`}
+                className={`relative flex-1 min-h-0 px-4 pt-1 pb-3 ${(isPdf || isScrollMode) ? "overflow-auto" : "overflow-hidden"}`}
                 data-ui="body"
                 onClick={handleReadingSurfaceClick}
             >
@@ -1633,8 +2179,12 @@ export function ReadingViewer({ book, onBack }: Props) {
                             onTotalPages={setPdfTotalPages}
                             onCurrentPage={setPdfCurrentPage}
                             jumpToPage={pdfJumpPage}
+                            onJumpComplete={handlePdfJumpComplete}
                             onCopyAnnotation={copyToClipboard}
-                            onDeleteAnnotation={(annotationId) => { void handleDeleteReadingAnnotation(annotationId); }}
+                            onDeleteAnnotation={handleDeleteReadingAnnotation}
+                            zoom={readingConfig.pdfZoom ?? 1}
+                            preloadRadius={readingConfig.pdfPreloadRadius ?? 3}
+                            preloadEnabled={readingConfig.pdfPreloadEnabled !== false}
                         />
                     </>
                 ) : !chaptersLoaded ? (
@@ -1656,6 +2206,33 @@ export function ReadingViewer({ book, onBack }: Props) {
                         <div className="reading-debug-line">当前章节索引：{chapterIndex}</div>
                         <div className="reading-debug-line">当前页进度：{txtPage + 1}/{txtTotalPages}</div>
                         <div className="reading-debug-hint">章节数据存在，但当前索引取不到正文。这个状态不是“正在加载”，而是本地章节数据和进度状态不一致。</div>
+                    </div>
+                ) : isScrollMode ? (
+                    <div ref={scrollContentRef} className="reading-scroll-content">
+                        {windowChapters.map((chapter) => (
+                            <div key={chapter.id} data-chapter-index={chapter.index}>
+                                {chapter.paragraphs.map((paragraph, pIndex) => {
+                                    const segmentCount = paragraph.split("\n").length;
+                                    const paragraphAnnotations = annotations.filter(
+                                        (annotation) => annotation.chapterIndex === chapter.index && annotation.paragraphIndex === pIndex
+                                    );
+                                    return (
+                                        <div key={pIndex} className="reading-scroll-block">
+                                            {paragraph.split("\n").map((segment, sIndex) => (
+                                                <p
+                                                    key={sIndex}
+                                                    className={`reading-line reading-line-indent${sIndex === segmentCount - 1 ? " reading-line-seg-end" : ""}`}
+                                                >
+                                                    {segment}
+                                                </p>
+                                            ))}
+                                            {paragraphAnnotations.map((annotation) => renderAnnotationItem(annotation))}
+                                        </div>
+                                    );
+                                })}
+                            </div>
+                        ))}
+                        <div className="h-[72px]" aria-hidden="true" />
                     </div>
                 ) : (
                     <>
@@ -1689,7 +2266,7 @@ export function ReadingViewer({ book, onBack }: Props) {
 
             {/* Immersive Page Number */}
             <span className={`reading-immersive-page ${immersive ? 'opacity-35' : 'opacity-0'}`}>
-                {isPdf ? `${pdfCurrentPage}/${pdfTotalPages || "?"}` : `${txtDisplayedPage}/${txtTotalPages}`}
+                {isPdf ? `${pdfCurrentPage}/${pdfTotalPages || "?"}` : isScrollMode ? `${Math.round(Math.max(0, Math.min(1, scrollFraction)) * 100)}%` : `${txtDisplayedPage}/${txtTotalPages}`}
             </span>
 
             {/* Bottom bar — mirrors header style */}
@@ -1749,10 +2326,21 @@ export function ReadingViewer({ book, onBack }: Props) {
                             <PenLine size={22} strokeWidth={1.7} />
                             <span>写批注</span>
                         </button>
+                        {isPdf && (
+                            <button
+                                type="button"
+                                className="reading-footer-icon-btn"
+                                onClick={openPdfPrefetchDialog}
+                                disabled={generating || !companionId}
+                            >
+                                <Rocket size={22} strokeWidth={1.7} />
+                                <span>预批注</span>
+                            </button>
+                        )}
                         <button
                             type="button"
                             className="reading-footer-icon-btn"
-                            onClick={() => setShowReadingSettings(true)}
+                            onClick={openReadingSettings}
                         >
                             <Languages size={22} strokeWidth={1.7} />
                             <span>设置</span>
@@ -1831,7 +2419,7 @@ export function ReadingViewer({ book, onBack }: Props) {
                                 <button type="button" onClick={() => { if (shouldIgnoreChatAction()) return; setChatExpanded(false); }} className="reading-chat-float-close" aria-label="收起聊天窗口"><ChevronDown size={18} strokeWidth={2} /></button>
                                 <button type="button" onClick={() => { if (shouldIgnoreChatAction()) return; handleCloseChat(); }} className="reading-chat-float-close" aria-label="关闭聊天悬浮窗"><Minus size={18} strokeWidth={2} /></button>
                             </div>
-                            <div className="reading-chat-float-body" onClick={() => {
+                            <div ref={chatListRef} className="reading-chat-float-body" onClick={() => {
                                 if (activeMessageId || readingMessageMenu) closeReadingMessageMenu();
                                 if (activeAnnotationId) setActiveAnnotationId(null);
                             }} onScroll={() => {
@@ -2000,12 +2588,53 @@ export function ReadingViewer({ book, onBack }: Props) {
                     </div>
                 </ContentDialog>
             )}
+            {pdfPrefetchDialogOpen && (
+                <ContentDialog
+                    title="PDF 预批注"
+                    confirmLabel="开始预批注"
+                    cancelLabel="取消"
+                    onConfirm={() => { void handlePdfManualPrefetch(); }}
+                    onCancel={() => setPdfPrefetchDialogOpen(false)}
+                >
+                    <div className="reading-settings-grid">
+                        <p className="reading-settings-inline-note">
+                            <span>为指定页码范围提前生成批注（先解析文本层再生成，翻到那里就是现成的）。</span>
+                        </p>
+                        <div className="reading-settings-inline-note">
+                            <span>起始页</span>
+                            <input
+                                value={pdfPrefetchStartInput}
+                                onChange={(e) => setPdfPrefetchStartInput(e.target.value.replace(/[^\d]/g, ""))}
+                                className="ui-input"
+                                inputMode="numeric"
+                            />
+                        </div>
+                        <div className="reading-settings-inline-note">
+                            <span>结束页</span>
+                            <input
+                                value={pdfPrefetchEndInput}
+                                onChange={(e) => setPdfPrefetchEndInput(e.target.value.replace(/[^\d]/g, ""))}
+                                className="ui-input"
+                                inputMode="numeric"
+                            />
+                        </div>
+                        <p className="reading-settings-inline-note">
+                            <span>当前第 {Math.max(1, pdfCurrentPage)} / {Math.max(1, pdfTotalPages)} 页。一次最多 {MAX_MANUAL_PDF_PREFETCH_PAGES} 页。</span>
+                        </p>
+                        {annotationError && (
+                            <p className="reading-settings-inline-note" style={{ color: "var(--c-danger)" }}>
+                                <span>{annotationError}</span>
+                            </p>
+                        )}
+                    </div>
+                </ContentDialog>
+            )}
             {showReadingSettings && (
                 <ContentDialog
-                    title="阅读双语翻译"
+                    title="阅读设置"
                     confirmLabel="完成"
                     cancelLabel="关闭"
-                    onConfirm={() => setShowReadingSettings(false)}
+                    onConfirm={handleReadingSettingsConfirm}
                     onCancel={() => setShowReadingSettings(false)}
                 >
                     <div className="reading-settings-grid">
@@ -2064,6 +2693,54 @@ export function ReadingViewer({ book, onBack }: Props) {
                                     }}
                                 />
                             </div>
+                        )}
+
+                        {isPdf && (
+                            <section className="reading-settings-group">
+                                <div className="reading-settings-heading">
+                                    <ZoomIn size={15} />
+                                    <span>PDF 渲染</span>
+                                </div>
+                                <div className="reading-settings-toggle-row">
+                                    <span className="reading-settings-toggle-label">预加载后续页</span>
+                                    <Toggle
+                                        checked={pdfRenderDraft.pdfPreloadEnabled}
+                                        onChange={(next) => setPdfRenderDraft((prev) => ({ ...prev, pdfPreloadEnabled: next }))}
+                                    />
+                                </div>
+                                <p className="reading-settings-inline-note">
+                                    <span>开启后阅读时会提前渲染当前页之后的页面，滚动更平滑；关闭则只渲染屏幕内的页。</span>
+                                </p>
+                                <div className="reading-settings-inline-note">
+                                    <span>页面缩放率</span>
+                                    <span>{Math.round(pdfRenderDraft.pdfZoom * 100)}%</span>
+                                </div>
+                                <input
+                                    type="range"
+                                    className="w-full my-1"
+                                    min={0.5}
+                                    max={2}
+                                    step={0.05}
+                                    value={pdfRenderDraft.pdfZoom}
+                                    onChange={(e) => setPdfRenderDraft((prev) => ({ ...prev, pdfZoom: Number(e.target.value) }))}
+                                />
+                                <div className="reading-settings-inline-note">
+                                    <span>一次渲染页数（当前页前后各几页）</span>
+                                    <span>{pdfRenderDraft.pdfPreloadRadius} 页</span>
+                                </div>
+                                <input
+                                    type="range"
+                                    className="w-full my-1"
+                                    min={1}
+                                    max={8}
+                                    step={1}
+                                    value={pdfRenderDraft.pdfPreloadRadius}
+                                    onChange={(e) => setPdfRenderDraft((prev) => ({ ...prev, pdfPreloadRadius: Number(e.target.value) }))}
+                                />
+                                <p className="reading-settings-inline-note">
+                                    <span>提示：一次渲染页数过少时，滑动到未渲染的页会反复渲染，造成闪烁卡顿；调大并开启预加载可缓解。缩放率调大后一页更接近一屏。</span>
+                                </p>
+                            </section>
                         )}
                     </div>
                 </ContentDialog>

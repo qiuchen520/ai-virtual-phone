@@ -11,7 +11,15 @@ import type {
   StoreIndexBackup,
   StoreRecordBackup,
 } from "./types";
-import { deserializeValue, estimateValueBytes, serializeValue, type MediaCollector, type MediaResolver } from "./serializers";
+import {
+  deserializeStorageString,
+  deserializeValue,
+  estimateValueBytes,
+  serializeStorageString,
+  serializeValue,
+  type MediaCollector,
+  type MediaResolver,
+} from "./serializers";
 import { kvEntries, kvGet, kvRemove, kvSetAsync } from "../kv-db";
 
 type SourceStats = {
@@ -140,14 +148,45 @@ export function deleteDatabase(dbName: string): Promise<void> {
   });
 }
 
-async function openDb(dbName: string, version?: number, upgrade?: (db: IDBDatabase, tx: IDBTransaction | null) => void): Promise<IDBDatabase | null> {
+async function openDb(
+  dbName: string,
+  version?: number,
+  upgrade?: (db: IDBDatabase, tx: IDBTransaction | null) => void,
+  opts: { blockedGraceMs?: number; deadlineMs?: number } = {},
+): Promise<IDBDatabase | null> {
   if (!hasIndexedDb()) return null;
   return new Promise((resolve) => {
     const request = version ? indexedDB.open(dbName, version) : indexedDB.open(dbName);
+    let settled = false;
+    let blockedTimer: ReturnType<typeof setTimeout> | undefined;
+    let deadlineTimer: ReturnType<typeof setTimeout> | undefined;
+    const settle = (db: IDBDatabase | null) => {
+      if (settled) {
+        // 超时放弃之后连接才姗姗来迟：没人用了，关掉防泄漏。
+        db?.close();
+        return;
+      }
+      settled = true;
+      if (blockedTimer) clearTimeout(blockedTimer);
+      if (deadlineTimer) clearTimeout(deadlineTimer);
+      resolve(db);
+    };
+    // 排在一个被 blocked 的升级请求后面的 open 不会收到任何事件，只会无限挂起，
+    // 需要总体超时兜底（IDBOpenDBRequest 无法取消，迟到的连接由 settle 关闭）。
+    if (opts.deadlineMs && opts.deadlineMs > 0) {
+      deadlineTimer = setTimeout(() => settle(null), opts.deadlineMs);
+    }
     request.onupgradeneeded = () => upgrade?.(request.result, request.transaction);
-    request.onsuccess = () => resolve(request.result);
-    request.onerror = () => resolve(null);
-    request.onblocked = () => resolve(null);
+    request.onsuccess = () => settle(request.result);
+    request.onerror = () => settle(null);
+    // blocked ≠ 失败：持有旧连接的页面随时可能松手（Dexie 等库收到 versionchange
+    // 会自动关闭），之后 success 照常触发。立刻放弃会让「应用自己开着库」这种
+    // 最常见的场景整库导入失败（恢复内容不全），所以给一个宽限窗口，等不到再放弃。
+    request.onblocked = () => {
+      const grace = opts.blockedGraceMs ?? 0;
+      if (grace <= 0) return settle(null);
+      if (!blockedTimer) blockedTimer = setTimeout(() => settle(null), grace);
+    };
   });
 }
 
@@ -182,9 +221,18 @@ function getStoreNames(db: IDBDatabase, source: IndexedDbSource): string[] {
   return source.stores?.filter((store) => all.includes(store)) ?? all;
 }
 
-async function exportIndexedDbSource(source: IndexedDbSource, collector?: MediaCollector): Promise<IndexedDbSourceBackup> {
+async function exportIndexedDbSource(
+  source: IndexedDbSource,
+  collector?: MediaCollector,
+  excludeMedia = false,
+): Promise<IndexedDbSourceBackup> {
   const db = await openDb(source.dbName);
-  if (!db) return { type: "indexeddb", dbName: source.dbName, stores: [] };
+  if (!db) {
+    // 打不开 ≠ 没数据：无版本 open 对不存在的库会新建空库并成功返回，
+    // 走到这里说明是真报错（被浏览器清除中/损坏/被占用）。必须带出错误，
+    // 否则会打出一个"看起来成功、实际缺整库"的备份（用户实报踩坑）。
+    return { type: "indexeddb", dbName: source.dbName, stores: [], error: `无法打开数据库 ${source.dbName}（可能已被浏览器清除或损坏）` };
+  }
 
   try {
     const storeNames = getStoreNames(db, source);
@@ -221,10 +269,15 @@ async function exportIndexedDbSource(source: IndexedDbSource, collector?: MediaC
         request.onerror = () => reject(request.error);
       });
 
-      for (const record of rawRecords) {
+      // 逐条序列化，并立刻松开原始记录的引用。游标必须先排空（IDB 事务里不能 await），
+      // 但排空之后没理由让原始值和序列化结果两份同时活着——大库导出时这份多余的拷贝
+      // 就是压垮移动端的最后一根稻草。原地置空，顺序不变，边走边还内存。
+      for (let index = 0; index < rawRecords.length; index += 1) {
+        const record = rawRecords[index];
+        rawRecords[index] = undefined as unknown as StoreRecordBackup;
         records.push({
           key: await serializeValue(record.key),
-          value: await serializeValue(record.value, collector),
+          value: await serializeValue(record.value, collector, { excludeMedia }),
         });
       }
 
@@ -249,10 +302,19 @@ async function readKvRecords(source: KvSource): Promise<{ key: string; value: st
   if (db && Array.from(db.objectStoreNames).includes("entries")) {
     try {
       const transaction = db.transaction("entries", "readonly");
-      const records = await runRequest<Array<{ key: string; value: string }>>(transaction.objectStore("entries").getAll());
-      for (const record of records) {
-        if (matchesKey(record.key, source)) byKey.set(record.key, record);
-      }
+      const request = transaction.objectStore("entries").openCursor();
+      await new Promise<void>((resolve, reject) => {
+        request.onsuccess = () => {
+          const cursor = request.result;
+          if (!cursor) return resolve();
+          const record = cursor.value as { key: string; value: string };
+          if (matchesKey(record.key, source)) byKey.set(record.key, record);
+          cursor.continue();
+        };
+        request.onerror = () => reject(request.error);
+        transaction.onerror = () => reject(transaction.error);
+        transaction.onabort = () => reject(transaction.error);
+      });
     } catch {
       // Fall back to cache-only below.
     } finally {
@@ -266,26 +328,31 @@ async function readKvRecords(source: KvSource): Promise<{ key: string; value: st
   return Array.from(byKey.values()).sort((a, b) => a.key.localeCompare(b.key));
 }
 
-async function exportKvSource(source: KvSource): Promise<KvSourceBackup> {
-  return { type: "kv", records: await readKvRecords(source) };
+async function exportKvSource(source: KvSource, collector?: MediaCollector): Promise<KvSourceBackup> {
+  const records = await readKvRecords(source);
+  if (!collector) return { type: "kv", records };
+  for (let index = 0; index < records.length; index += 1) {
+    records[index] = { ...records[index], value: await serializeStorageString(records[index].value, collector) };
+  }
+  return { type: "kv", records };
 }
 
-function exportLocalStorageSource(source: LocalStorageSource): LocalStorageSourceBackup {
+async function exportLocalStorageSource(source: LocalStorageSource, collector?: MediaCollector): Promise<LocalStorageSourceBackup> {
   if (typeof window === "undefined") return { type: "localStorage", records: [] };
   const records: { key: string; value: string }[] = [];
   for (let index = 0; index < window.localStorage.length; index += 1) {
     const key = window.localStorage.key(index);
     if (!key || !matchesKey(key, source)) continue;
     const value = window.localStorage.getItem(key);
-    if (value !== null) records.push({ key, value });
+    if (value !== null) records.push({ key, value: await serializeStorageString(value, collector) });
   }
   return { type: "localStorage", records };
 }
 
-export async function exportSource(source: DataSource, collector?: MediaCollector): Promise<SourceBackup> {
-  if (source.type === "indexeddb") return exportIndexedDbSource(source, collector);
-  if (source.type === "kv") return exportKvSource(source);
-  return exportLocalStorageSource(source);
+export async function exportSource(source: DataSource, collector?: MediaCollector, excludeMedia = false): Promise<SourceBackup> {
+  if (source.type === "indexeddb") return exportIndexedDbSource(source, collector, excludeMedia);
+  if (source.type === "kv") return exportKvSource(source, collector);
+  return exportLocalStorageSource(source, collector);
 }
 
 export async function inspectSource(source: DataSource): Promise<SourceStats> {
@@ -431,53 +498,83 @@ async function ensureStores(dbName: string, specs: StoreSpec[]): Promise<IDBData
       applySpecIndexes(store, spec);
       ensureKnownStoreIndexes(dbName, store);
     }
-  });
+  }, { blockedGraceMs: 15_000 });
+  // 升级被占用/失败时退回无版本打开：能写进已存在的 store 就写，缺失的 store
+  // 由导入侧逐个上报。整库直接放弃（旧行为）= 用户看到「恢复完成」但整块数据没了。
+  // 这个回退 open 会排在仍然 blocked 的升级请求后面，必须带总体超时。
+  if (!db) db = await openDb(dbName, undefined, undefined, { deadlineMs: 3_000 });
   return db;
 }
 
-export async function importSource(payload: SourceBackup, overwrite = false, resolver?: MediaResolver): Promise<{ added: number; skipped: number; overwritten: number; errors: string[] }> {
+export async function importSource(
+  payload: SourceBackup,
+  overwrite = false,
+  resolver?: MediaResolver,
+  onProgress?: (done: number, total: number) => void,
+): Promise<{ added: number; skipped: number; overwritten: number; errors: string[] }> {
   const result = { added: 0, skipped: 0, overwritten: 0, errors: [] as string[] };
+  const totalRecords = payload.type === "indexeddb"
+    ? payload.stores.reduce((sum, store) => sum + store.records.length, 0)
+    : payload.records.length;
+  let doneRecords = 0;
+  const tick = () => {
+    doneRecords += 1;
+    onProgress?.(doneRecords, totalRecords);
+  };
 
   if (payload.type === "localStorage") {
     for (const record of payload.records) {
-      const exists = window.localStorage.getItem(record.key) !== null;
-      if (exists && !overwrite) {
-        result.skipped += 1;
-        continue;
+      // 单条失败（配额满、单条数据损坏）只损失这一条，剩下的照常导入。
+      try {
+        const exists = window.localStorage.getItem(record.key) !== null;
+        if (exists && !overwrite) {
+          result.skipped += 1;
+          continue;
+        }
+        const value = await deserializeStorageString(record.value, resolver);
+        window.localStorage.setItem(record.key, value);
+        if (exists) result.overwritten += 1;
+        else result.added += 1;
+      } catch (error) {
+        result.errors.push(`localStorage.${record.key}: ${formatImportError(error)}`);
+      } finally {
+        tick();
       }
-      window.localStorage.setItem(record.key, record.value);
-      if (exists) result.overwritten += 1;
-      else result.added += 1;
     }
     return result;
   }
 
   if (payload.type === "kv") {
-    try {
-      for (const record of payload.records) {
+    for (const record of payload.records) {
+      // 逐条兜底：以前整个循环包在一个 try 里，第一条出错后剩余记录全部
+      // 静默丢弃——正是「恢复内容不全」的来源之一。
+      try {
+        const incoming = await deserializeStorageString(record.value, resolver);
         const existing = kvGet(record.key);
         const exists = existing !== null;
         if (!exists) {
-          await kvSetAsync(record.key, record.value);
+          await kvSetAsync(record.key, incoming);
           result.added += 1;
           continue;
         }
         if (overwrite) {
-          await kvSetAsync(record.key, record.value);
+          await kvSetAsync(record.key, incoming);
           result.overwritten += 1;
           continue;
         }
-        const merged = tryMergeJsonArrayByKey(existing, record.value)
-          ?? tryReplaceEmptyJsonValue(existing, record.value);
+        const merged = tryMergeJsonArrayByKey(existing, incoming)
+          ?? tryReplaceEmptyJsonValue(existing, incoming);
         if (!merged) {
           result.skipped += 1;
           continue;
         }
         await kvSetAsync(record.key, merged);
         result.overwritten += 1;
+      } catch (error) {
+        result.errors.push(`kv.${record.key}: ${formatImportError(error)}`);
+      } finally {
+        tick();
       }
-    } catch (error) {
-      result.errors.push(String(error));
     }
     return result;
   }
@@ -493,6 +590,14 @@ export async function importSource(payload: SourceBackup, overwrite = false, res
   }
   try {
     for (const storePayload of payload.stores) {
+      if (!db.objectStoreNames.contains(storePayload.name)) {
+        // 升级被其它连接挡住又等不到 → 该 store 建不出来。一次性上报清楚，
+        // 而不是对每条记录抛一个 NotFoundError。
+        result.errors.push(`${payload.dbName}.${storePayload.name}: 数据库被其它页面占用，无法创建该对象仓库，已跳过 ${storePayload.records.length} 条（请关闭其它标签页后重试）`);
+        doneRecords += storePayload.records.length;
+        onProgress?.(doneRecords, totalRecords);
+        continue;
+      }
       for (let recordIndex = 0; recordIndex < storePayload.records.length; recordIndex += 1) {
         let done: Promise<void> | null = null;
         try {
@@ -520,6 +625,8 @@ export async function importSource(payload: SourceBackup, overwrite = false, res
         } catch (error) {
           await done?.catch(() => undefined);
           result.errors.push(`${payload.dbName}.${storePayload.name}#${recordIndex + 1}: ${formatImportError(error)}`);
+        } finally {
+          tick();
         }
       }
     }

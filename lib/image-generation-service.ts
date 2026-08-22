@@ -371,6 +371,13 @@ async function generateImageDirect(params: {
 // 「代理中转」模式:配置了通用代理(CF Worker)就只走它——用户选择什么模式就走什么链路,
 // 不做隐藏回落(不再兜底到 Netlify 函数,那会消耗站点额度且有 60s 上限)。
 // 常量未配置时保留旧的 Netlify 心跳流式路由(自部署无 Worker 的场景)。
+//
+// Netlify 心跳路由是站点额度的最大计算开销之一(每张图占用函数 30~120s),而不少
+// 选了「服务端转发」的用户,其生图 API 其实允许跨域。因此走 Netlify 前先试一次
+// 浏览器直连:直连因 CORS 失败(预检被拒,真实请求未发出,上游不会计费)才回落
+// 到服务端,并按 baseUrl 记住失败结果,本次会话内不再重复探测。
+const directCorsFailedBaseUrls = new Set<string>();
+
 async function generateImageViaServerOrProxy(params: {
   settings: ImageGenerationSettings;
   prompt: string;
@@ -386,6 +393,19 @@ async function generateImageViaServerOrProxy(params: {
         throw new Error("生图代理连接失败:当前网络可能无法访问代理服务器(部分地区需开启代理),或稍后重试。");
       }
       throw error;
+    }
+  }
+  const baseUrlKey = normalizeBaseUrl(params.settings.baseUrl);
+  if (!directCorsFailedBaseUrls.has(baseUrlKey)) {
+    try {
+      return await generateImageDirect(params);
+    } catch (error) {
+      const message = error instanceof Error ? error.message : String(error);
+      // 只有连接层失败(CORS/断网)才回落;API 自身的错误(密钥无效、余额不足等)
+      // 说明直连是通的,换服务端转发也会得到同样错误,直接抛出避免重复计费。
+      if (!message.includes("浏览器直连失败")) throw error;
+      throwIfAborted(params.signal);
+      directCorsFailedBaseUrls.add(baseUrlKey);
     }
   }
   return generateImageViaServer(params);

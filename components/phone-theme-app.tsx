@@ -16,13 +16,15 @@ import {
   Wallpaper,
 } from "lucide-react";
 import CSSSchemeBar from "@/components/ui/css-scheme-picker";
+import { GlassIcon } from "@/components/ui/glass-icon";
 import { normalizeThemeProfile, resolveActiveIconSkins, DEFAULT_THEME_PROFILE, type ThemeProfile } from "@/lib/theme-types";
 import type { DesktopIconId, IconId } from "@/lib/desktop-config";
-import { DOCK_DEFAULT, PAGE_1_DEFAULT, PAGE_2_DEFAULT, ICONS } from "@/lib/desktop-config";
-import type { DesktopIconLayout } from "@/lib/desktop-layout-storage";
+import { DOCK_DEFAULT, PAGE_1_DEFAULT, PAGE_2_DEFAULT, PAGE_3_DEFAULT, ICONS } from "@/lib/desktop-config";
+import type { DesktopFolderMap, DesktopIconLayout } from "@/lib/desktop-layout-storage";
 import { CUSTOM_APPS_UPDATED_EVENT, loadInstalledCustomApps } from "@/lib/custom-app-storage";
 import { toCustomAppIconId, type InstalledCustomApp } from "@/lib/custom-app-types";
 import { PageShell } from "@/components/ui/page-shell";
+import { readPwaDisplayPreference, writePwaDisplayPreference } from "@/lib/pwa-display-mode";
 import {
   GRID_COLS,
   GRID_ROWS,
@@ -82,6 +84,7 @@ type PhoneThemeAppProps = {
     widgets: WidgetInstance[];
     iconLayout: DesktopIconLayout;
     dock?: DesktopIconId[];
+    folders?: DesktopFolderMap;
   }) => void;
   pageIcons: DesktopIconLayout;
   iconSkins: Record<string, string | null>;
@@ -135,20 +138,22 @@ function IconReset() {
 const MENU_ITEMS: Array<{
   section: ThemeMenuItemSection;
   icon: () => React.JSX.Element;
+  /** 菜单里用的玻璃图标名，见 assets/glass-icons/ */
+  glass: string;
   label: string;
   desc?: string;
   color?: string;
   glow?: string;
 }> = [
-  { section: "palette", icon: IconPalette, label: "主题色", desc: "调色板预设", color: BINDING_ACCENTS.preset, glow: `color-mix(in srgb, ${BINDING_ACCENTS.preset} 35%, transparent)` },
-  { section: "wallpaper", icon: IconWallpaper, label: "壁纸", desc: "桌面背景", color: BINDING_ACCENTS.api, glow: `color-mix(in srgb, ${BINDING_ACCENTS.api} 35%, transparent)` },
-  { section: "icons", icon: IconGrid, label: "图标", desc: "应用图标", color: BINDING_ACCENTS.regex, glow: `color-mix(in srgb, ${BINDING_ACCENTS.regex} 35%, transparent)` },
-  { section: "widgets", icon: IconWidgets, label: "桌面组件", desc: "小组件", color: BINDING_ACCENTS.voice, glow: `color-mix(in srgb, ${BINDING_ACCENTS.voice} 35%, transparent)` },
-  { section: "case", icon: IconCase, label: "状态栏", color: BINDING_ACCENTS.memory },
-  { section: "text", icon: IconText, label: "文字", color: BINDING_ACCENTS.identity, glow: `color-mix(in srgb, ${BINDING_ACCENTS.identity} 35%, transparent)` },
-  { section: "css", icon: IconCode, label: "CSS 变量", desc: "自定义全局样式变量", color: BINDING_ACCENTS.embedding, glow: `color-mix(in srgb, ${BINDING_ACCENTS.embedding} 35%, transparent)` },
-  { section: "transfer", icon: IconTransfer, label: "主题导入 / 导出", desc: "备份与迁移", color: BINDING_ACCENTS.api, glow: `color-mix(in srgb, ${BINDING_ACCENTS.api} 35%, transparent)` },
-  { section: "reset", icon: IconReset, label: "恢复默认", desc: "重置外观", color: BINDING_ACCENTS.regex, glow: `color-mix(in srgb, ${BINDING_ACCENTS.regex} 30%, transparent)` },
+  { section: "palette", icon: IconPalette, label: "主题色", desc: "调色板预设", color: BINDING_ACCENTS.preset, glow: `color-mix(in srgb, ${BINDING_ACCENTS.preset} 35%, transparent)`, glass: "palette" },
+  { section: "wallpaper", icon: IconWallpaper, label: "壁纸", desc: "桌面背景", color: BINDING_ACCENTS.api, glow: `color-mix(in srgb, ${BINDING_ACCENTS.api} 35%, transparent)`, glass: "wallpaper" },
+  { section: "icons", icon: IconGrid, label: "图标", desc: "应用图标", color: BINDING_ACCENTS.regex, glow: `color-mix(in srgb, ${BINDING_ACCENTS.regex} 35%, transparent)`, glass: "icons" },
+  { section: "widgets", icon: IconWidgets, label: "桌面组件", desc: "小组件", color: BINDING_ACCENTS.voice, glow: `color-mix(in srgb, ${BINDING_ACCENTS.voice} 35%, transparent)`, glass: "widgets" },
+  { section: "case", icon: IconCase, label: "状态栏", color: BINDING_ACCENTS.memory, glass: "status-bar" },
+  { section: "text", icon: IconText, label: "文字", color: BINDING_ACCENTS.identity, glow: `color-mix(in srgb, ${BINDING_ACCENTS.identity} 35%, transparent)`, glass: "text" },
+  { section: "css", icon: IconCode, label: "CSS 变量", desc: "自定义全局样式变量", color: BINDING_ACCENTS.embedding, glow: `color-mix(in srgb, ${BINDING_ACCENTS.embedding} 35%, transparent)`, glass: "css" },
+  { section: "transfer", icon: IconTransfer, label: "主题导入 / 导出", desc: "备份与迁移", color: BINDING_ACCENTS.api, glow: `color-mix(in srgb, ${BINDING_ACCENTS.api} 35%, transparent)`, glass: "theme-transfer" },
+  { section: "reset", icon: IconReset, label: "恢复默认", desc: "重置外观", color: BINDING_ACCENTS.regex, glow: `color-mix(in srgb, ${BINDING_ACCENTS.regex} 30%, transparent)`, glass: "theme-reset" },
 ];
 
 const menuIconStyle = (color?: string): CSSProperties => ({
@@ -195,6 +200,7 @@ export function PhoneThemeApp({
     return "menu";
   });
   const [showStatusBarAdjust, setShowStatusBarAdjust] = useState(false);
+  const [systemBarShown, setSystemBarShown] = useState(() => typeof document !== "undefined" && readPwaDisplayPreference(document.cookie) === "standalone");
   const [showTextAdjust, setShowTextAdjust] = useState(false);
   const [showThemeTransfer, setShowThemeTransfer] = useState(false);
   const [themeTransferBusy, setThemeTransferBusy] = useState(false);
@@ -233,7 +239,7 @@ export function PhoneThemeApp({
     setThemeTransferBusy(true);
     try {
       const result = await installThemePackageFile(file);
-      onDesktopThemeChange({ widgets: result.widgets, iconLayout: result.iconLayout, dock: result.dock });
+      onDesktopThemeChange({ widgets: result.widgets, iconLayout: result.iconLayout, dock: result.dock, folders: result.folders });
       await onApply(result.themeProfile);
       onDraftChange(result.themeProfile);
       setShowThemeTransfer(false);
@@ -250,7 +256,7 @@ export function PhoneThemeApp({
     setThemeTransferBusy(true);
     try {
       const result = await resetThemePackageState();
-      onDesktopThemeChange({ widgets: result.widgets, iconLayout: result.iconLayout, dock: result.dock });
+      onDesktopThemeChange({ widgets: result.widgets, iconLayout: result.iconLayout, dock: result.dock, folders: result.folders });
       await onApply(result.themeProfile);
       onDraftChange(result.themeProfile);
       setConfirmThemeReset(false);
@@ -292,8 +298,8 @@ export function PhoneThemeApp({
                       }
                     }}
                   >
-                    <span className="card-icon" style={menuIconStyle(item.color)}>
-                      <item.icon />
+                    <span className="card-icon card-icon-glass">
+                      <GlassIcon name={item.glass} />
                     </span>
                     <span className="card-card-body">
                       <span className="card-label">{item.label}</span>
@@ -314,7 +320,7 @@ export function PhoneThemeApp({
                   const caseItem = MENU_ITEMS.find(i => i.section === "case")!;
                   return (
                     <div className="menu-item cursor-pointer" onClick={() => setShowStatusBarAdjust(true)}>
-                      <span className="card-icon" style={menuIconStyle(caseItem.color)}><caseItem.icon /></span>
+                      <span className="card-icon card-icon-glass"><GlassIcon name={caseItem.glass} /></span>
                       <span className="menu-label appearance-menu-item-label">{caseItem.label}</span>
                       <label
                         className="block w-10 h-[22px] cursor-pointer relative shrink-0 ml-auto"
@@ -347,8 +353,8 @@ export function PhoneThemeApp({
                     type="button"
                     onClick={() => setShowTextAdjust(true)}
                   >
-                    <span className="card-icon" style={menuIconStyle(item.color)}>
-                      <item.icon />
+                    <span className="card-icon card-icon-glass">
+                      <GlassIcon name={item.glass} />
                     </span>
                     <span className="menu-label appearance-menu-item-label">{item.label}</span>
                     <span className="menu-right">
@@ -370,8 +376,8 @@ export function PhoneThemeApp({
                     type="button"
                     onClick={() => setSection("css")}
                   >
-                    <span className="card-icon" style={menuIconStyle(cssItem.color)}>
-                      <cssItem.icon />
+                    <span className="card-icon card-icon-glass">
+                      <GlassIcon name={cssItem.glass} />
                     </span>
                     <div className="card-featured-body">
                       <div className="card-featured-label">{cssItem.label}</div>
@@ -400,8 +406,8 @@ export function PhoneThemeApp({
                       }
                     }}
                   >
-                    <span className="card-icon" style={menuIconStyle(item.color)}>
-                      <item.icon />
+                    <span className="card-icon card-icon-glass">
+                      <GlassIcon name={item.glass} />
                     </span>
                     <span className="card-card-body">
                       <span className="card-label">{item.label}</span>
@@ -506,7 +512,7 @@ export function PhoneThemeApp({
       )}
       {showStatusBarAdjust && createPortal(
         <ContentDialog
-          title={"状态栏位置"}
+          title={"状态栏"}
           confirmLabel={"确定"}
           cancelLabel={"重置"}
           onConfirm={() => setShowStatusBarAdjust(false)}
@@ -519,6 +525,28 @@ export function PhoneThemeApp({
           }}
         >
           <div style={{ display: "flex", flexDirection: "column", gap: 12 }}>
+            <div style={{ display: "flex", justifyContent: "space-between", alignItems: "center" }}>
+              <span style={{ fontSize: "calc(13px*var(--app-text-scale,1))", color: "var(--c-text)" }}>{"显示系统状态栏"}</span>
+              <label className="block w-10 h-[22px] cursor-pointer relative shrink-0" onClick={(e) => e.stopPropagation()}>
+                <input
+                  type="checkbox"
+                  checked={systemBarShown}
+                  onChange={(e) => {
+                    const shown = e.target.checked;
+                    setSystemBarShown(shown);
+                    writePwaDisplayPreference(shown ? "standalone" : "fullscreen");
+                    if (shown && document.fullscreenElement) void document.exitFullscreen?.().catch(() => {});
+                    onNotice(shown ? "已开启系统状态栏，重新添加到桌面后完全生效" : "已恢复沉浸全屏，重新添加到桌面后完全生效");
+                  }}
+                  className="w-full h-full rounded-[11px] m-0 outline-none"
+                  style={{ appearance: "none", backgroundColor: systemBarShown ? "var(--c-success)" : "var(--c-page-body-bg)", border: systemBarShown ? "none" : "1px solid var(--c-input-border)", transition: "0.2s" }}
+                />
+                <div className="absolute w-[18px] h-[18px] bg-white rounded-full top-[2px] pointer-events-none" style={{ left: systemBarShown ? 20 : 2, transition: "0.2s", boxShadow: "0 2px 4px rgba(0,0,0,0.15)" }} />
+              </label>
+            </div>
+            <p style={{ fontSize: "calc(11px*var(--app-text-scale,1))", color: "var(--c-icon)", lineHeight: 1.4 }}>
+              {"显示手机系统自己的状态栏（时间/电量/通知），退出沉浸全屏，安卓不再反复弹全屏提示。开启后本页的虚拟状态栏不再显示；已装到桌面的需删除后重新「添加到主屏幕」才完全生效。"}
+            </p>
             <div style={{ display: "flex", justifyContent: "space-between", alignItems: "center" }}>
               <span style={{ fontSize: "calc(13px*var(--app-text-scale,1))", color: "var(--c-text)" }}>{"顶部偏移"}</span>
               <span style={{ fontSize: "calc(13px*var(--app-text-scale,1))", color: "var(--c-text-title)", fontWeight: 600 }}>{statusBarTop}px</span>
@@ -693,7 +721,7 @@ function PalettePresetPage({
   const [activeKey, setActiveKey] = useState<string | null>(null);
 
   return (
-    <div className="theme-section-page">
+    <div className="theme-section-page" data-bottom-reserve>
       <div className="flex flex-col gap-4">
         <div>
           <div className="grid grid-cols-4 gap-2">
@@ -952,7 +980,9 @@ function GlobalCSSPage({
    Icon Skin Page
    ══════════════════════════════════════════ */
 
-const BUILTIN_ICON_SKIN_IDS: IconId[] = [...PAGE_1_DEFAULT, ...PAGE_2_DEFAULT, ...DOCK_DEFAULT];
+// 三页桌面 + DOCK 的默认图标全收进来。漏了第三页时，筑境/工坊/资源集市/独家特调
+// 这四个图标在外观里根本没有格子，换不了皮肤。
+const BUILTIN_ICON_SKIN_IDS: IconId[] = [...PAGE_1_DEFAULT, ...PAGE_2_DEFAULT, ...PAGE_3_DEFAULT, ...DOCK_DEFAULT];
 
 type IconSkinItem = {
   id: DesktopIconId;
@@ -1138,7 +1168,7 @@ function IconSkinPage({
   }, [activeSkins, draft, onDraftChange, onApply, onNotice]);
 
   return (
-    <div className="theme-section-page" style={{ gap: 14 }}>
+    <div className="theme-section-page" data-bottom-reserve style={{ gap: 14 }}>
       <h3 className="appearance-menu-section-title">Icons</h3>
       <div className="is-grid">
         {iconSkinItems.map(item => {
@@ -1381,7 +1411,7 @@ function WallpaperPage({
   }, [onApply, onDraftChange]);
 
   return (
-    <div className="theme-section-page" style={{ gap: 14 }}>
+    <div className="theme-section-page" data-bottom-reserve style={{ gap: 14 }}>
       {/* Upload button */}
       <div className="flex flex-col items-center justify-center pt-2 pb-4 border-b border-black/5">
         <button
@@ -1576,7 +1606,7 @@ function WidgetManagerPage({
   }, [diyTemplates]);
 
   return (
-    <div className="theme-section-page flex flex-col gap-6" style={{ padding: "16px 20px" }}>
+    <div className="theme-section-page flex flex-col gap-6" data-bottom-reserve style={{ padding: "16px 20px 0" }}>
       
       {/* Studio Header Toggle */}
       <div className="flex flex-col gap-4">

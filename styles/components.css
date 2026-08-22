@@ -221,6 +221,7 @@
 .card-hero,
 .ui-collapsible,
 .ui-entry-card,
+.settings-account-card,
 .binding-choice-card,
 .binding-aux-select,
 .binding-detail-card {
@@ -1218,22 +1219,19 @@
   display: flex;
   align-items: center;
   gap: 10px;
-  margin: 8px 8px 0;
-  color: #000;
-  font-size: calc(18px*var(--app-text-scale,1));
-  font-style: italic;
+  margin: 8px 4px 0;
+  color: var(--c-icon);
+  font-size: calc(11.7px*var(--app-text-scale,1));
+  font-style: normal;
   font-weight: 700;
-  line-height: 1;
+  letter-spacing: 0.14em;
+  line-height: 1.2;
+  text-transform: uppercase;
 }
 
 .settings-menu-section-title::before,
 .appearance-menu-section-title::before {
-  content: "";
-  width: 4px;
-  height: 22px;
-  flex: 0 0 auto;
-  border-radius: 999px;
-  background: linear-gradient(180deg, color-mix(in srgb, var(--section-title-accent) 80%, white), var(--section-title-accent));
+  display: none;
 }
 
 .page-menu .settings-menu-section-title,
@@ -1361,6 +1359,33 @@
   line-height: 0;
 }
 
+/* 玻璃图标（assets/glass-icons，内联渲染）：自带体积和投影，套淡色圆底会变成"贴纸贴盘子" */
+.card-icon.card-icon-glass {
+  background: transparent;
+  box-shadow: none;
+}
+
+.glass-icon {
+  width: 30px;
+  height: 30px;
+  display: inline-flex;
+  align-items: center;
+  justify-content: center;
+  flex: none;
+  pointer-events: none;
+}
+
+.glass-icon > svg {
+  width: 100%;
+  height: 100%;
+  display: block;
+}
+
+.menu-item .glass-icon {
+  width: 26px;
+  height: 26px;
+}
+
 .card-icon {
   width: 48px;
   height: 48px;
@@ -1382,6 +1407,7 @@
 
 .card-desc {
   font-size: calc(9.9px*var(--app-text-scale,1));
+  font-weight: 500;
   color: var(--c-text);
   line-height: 1.3;
 }
@@ -1416,6 +1442,7 @@
 }
 .card-featured-desc {
   font-size: calc(10.8px*var(--app-text-scale,1));
+  font-weight: 500;
   color: var(--c-text);
   line-height: 1.4;
   margin-top: 3px;
@@ -2327,6 +2354,40 @@
 .memory-settings-menu .menu-item:not(:last-child)::after {
   left: 24px;
   right: 24px;
+}
+
+/* ── 记忆来源选择弹层：等宽胶囊，每行三个 ── */
+.memory-source-sheet .modal-header {
+  border-bottom: none;
+}
+
+.memory-source-chips {
+  display: grid;
+  grid-template-columns: repeat(3, 1fr);
+  gap: 8px;
+}
+
+.memory-source-chip {
+  padding: 11px 4px;
+  border: 0;
+  border-radius: 999px;
+  background: color-mix(in srgb, var(--chip-accent) 13%, var(--c-panel));
+  color: var(--chip-accent);
+  font-size: calc(11.5px*var(--app-text-scale,1));
+  font-weight: 500;
+  line-height: 1.2;
+  text-align: center;
+  cursor: pointer;
+  white-space: nowrap;
+  overflow: hidden;
+  text-overflow: ellipsis;
+  transition: background 160ms ease, color 160ms ease, opacity 160ms ease;
+}
+
+.memory-source-chip[data-off] {
+  background: var(--c-page-body-bg);
+  color: var(--c-icon);
+  font-weight: 400;
 }
 
 .data-management-menu .menu-label-group > .menu-label {
@@ -3550,6 +3611,7 @@
 
 .menu-desc {
   font-size: calc(10.8px*var(--app-text-scale,1));
+  font-weight: 500;
   color: var(--c-text);
   line-height: 1.4;
   margin-top: 2px;
@@ -5280,36 +5342,35 @@
   to { transform: rotate(360deg); }
 }
 
-/* ===== 设置页 · 账号卡片（Apple ID 式入口） ===== */
+/* ===== 设置页 · 账号卡片（Apple ID 式入口） =====
+   底色/毛玻璃/阴影统一走上面的 Unified Glass Primitives，这里只写自己的排版，
+   免得同一页里它是块实心白板、别的卡片是磨砂玻璃。 */
 .settings-account-card {
     display: flex;
     align-items: center;
     gap: 14px;
     width: 100%;
-    border: none;
     text-align: left;
     cursor: pointer;
-    background: var(--c-surface, #fff);
-    border-radius: 18px;
-    padding: 14px 16px;
-    box-shadow: 0 2px 10px rgba(0, 0, 0, 0.05);
-    color: var(--c-text, #222);
+    border-radius: var(--ui-radius-panel);
+    padding: 18px 20px;
+    color: var(--c-text);
+    transition: all 200ms cubic-bezier(0.2, 0, 0, 1);
+    opacity: 0;
+    animation: cardSlideUp 450ms cubic-bezier(0.2, 0, 0, 1) both;
 }
 .settings-account-card:active {
-    opacity: 0.75;
+    transform: scale(0.92) !important;
+    opacity: 0.8 !important;
 }
+/* 账号栏本来就没有真头像，放的是用户名首字母；改成与下面卡片同一套的玻璃图标 */
 .settings-account-avatar {
-    width: 52px;
-    height: 52px;
-    border-radius: 50%;
+    width: 48px;
+    height: 48px;
     flex: none;
     display: flex;
     align-items: center;
     justify-content: center;
-    font-size: 22px;
-    font-weight: 700;
-    color: #fff;
-    background: linear-gradient(135deg, #8fa3c8, #5e79a8);
 }
 .settings-account-copy {
     flex: 1;
@@ -5319,18 +5380,21 @@
     gap: 3px;
 }
 .settings-account-name {
-    font-size: 17px;
+    font-size: calc(15.3px*var(--app-text-scale,1));
     font-weight: 700;
+    color: var(--c-text-title);
+    line-height: 1.3;
     overflow: hidden;
     text-overflow: ellipsis;
     white-space: nowrap;
 }
 .settings-account-sub {
-    font-size: 12px;
-    color: var(--c-text-soft, #8a8f98);
+    font-size: calc(10.8px*var(--app-text-scale,1));
+    color: var(--c-text);
+    line-height: 1.4;
 }
 .settings-account-chevron {
-    color: var(--c-text-soft, #b3b8c2);
+    color: var(--c-icon);
     flex: none;
 }
 

@@ -40,7 +40,9 @@ const AUTO_REPLY_LOCK_TTL_MS = 3 * 60 * 1000;
 
 // 待回复标志与真实状态可能脱钩（函数中途被墙钟掐掉、标志写入失败等），
 // 空闲时每隔这么久做一次全量扫描自愈；期间新消息仍由入库路径实时置位标志。
-const PENDING_RECONCILE_INTERVAL_MS = 5 * 60 * 1000;
+// 全量扫描一次要 list + 最多 200 个对象逐个 GET，是空闲期 Storage 流量大头，
+// 30 分钟一次足够兜底（标志丢失的最坏后果是回复晚一个扫描周期）。
+const PENDING_RECONCILE_INTERVAL_MS = 30 * 60 * 1000;
 
 // 运行包体积可达 MB 级（含提示词模板、贴纸与参考图 base64），不能每轮全量
 // 下载。索引条目的 updatedAt 随小手机每次同步更新，作为缓存失效依据；TTL 兜底。
@@ -435,7 +437,12 @@ async function generateReply(env, runtime, cloudMessages, pendingMessages) {
     .sort((a, b) => messageTime(a).localeCompare(messageTime(b)));
 
   const imageAttachments = await loadVisionImageAttachments(env, runtime, [...cloudHistory, ...pendingMessages]);
-  const messages = normalizeLlmMessages(buildRuntimePromptMessages(runtime, cloudHistory, pendingMessages, imageAttachments));
+  // 小手机组装完会合并相邻同 role 的块（llm-prompt-assembler 收尾那一步），于是
+  // 「一轮」= user 一条 + assistant 一条。不合并的话微信每条消息都是独立的一条
+  // LLM 消息，模型看到的轮次粒度就从「轮」退化成「条」。
+  const messages = mergeAdjacentSameRoleMessages(
+    normalizeLlmMessages(buildRuntimePromptMessages(runtime, cloudHistory, pendingMessages, imageAttachments)),
+  );
 
   const request = buildChatCompletionRequest(apiConfig, preset, messages);
   // LLM 调用必须有超时：预留 ~30s 给后续的媒体生成与发送。
@@ -502,72 +509,190 @@ function clampVisionImagePromptLimit(value) {
   return Math.min(10, n);
 }
 
-function buildRuntimePromptMessages(runtime, cloudHistory, pendingMessages, imageAttachments = new Map()) {
+export function buildRuntimePromptMessages(runtime, cloudHistory, pendingMessages, imageAttachments = new Map()) {
   const template = runtime.promptContext?.promptTemplate;
   if (!template || !Array.isArray(template.beforeMessages) || !Array.isArray(template.afterMessages)) {
     throw new Error("runtime_missing_prompt_template: 运行包缺少轻量提示词模板，请先在小手机内重新同步运行包。");
   }
 
-  const historyMessages = [];
+  const collected = [];
   const seenExternalIds = new Set();
-  for (const message of cloudHistory) {
+  for (const message of [...cloudHistory, ...pendingMessages]) {
     if (!message?.externalId || seenExternalIds.has(message.externalId)) continue;
     seenExternalIds.add(message.externalId);
     const promptMessage = cloudStoredMessageToPromptMessage(runtime, message, imageAttachments);
-    if (promptMessage) historyMessages.push(promptMessage);
+    if (promptMessage) collected.push(promptMessage);
   }
 
-  for (const message of pendingMessages) {
-    if (!message?.externalId || seenExternalIds.has(message.externalId)) continue;
-    seenExternalIds.add(message.externalId);
-    const promptMessage = cloudStoredMessageToPromptMessage(runtime, message, imageAttachments);
-    if (promptMessage) historyMessages.push(promptMessage);
-  }
-
-  historyMessages.sort((a, b) => {
+  collected.sort((a, b) => {
     const at = a._createdAt || "";
     const bt = b._createdAt || "";
     if (at !== bt) return at.localeCompare(bt);
     return String(a._externalId || "").localeCompare(String(b._externalId || ""));
   });
 
+  const historyMessages = renderHistoryPromptMessages(collected);
+
+  // v2 运行包：深度注入（世界书 position=4 / 预设 injection_position≠0）不再钉死在
+  // 模板顶部，而是按「已烘焙历史 + 新微信消息」这条完整历史重新定位到「倒数第 depth
+  // 条」之前——与小手机每次生成都重算深度的行为一致。
+  // 必须把 bakedHistoryMessages 一起算进去：只拿新消息定位的话，新消息条数少于 depth
+  // 时注入块插不回旧历史内部，只能贴在它下面。
+  // 老运行包（v1，以及没有 bakedHistoryMessages 的过渡版本）自动退回旧拼接。
+  const usesDepthTemplate = Array.isArray(template.structuralMessages)
+    && Array.isArray(template.bakedHistoryMessages)
+    && Array.isArray(template.depthSegments);
+  if (!usesDepthTemplate) {
+    return [...template.beforeMessages, ...historyMessages, ...template.afterMessages];
+  }
+  const fullHistory = [...template.bakedHistoryMessages, ...historyMessages];
   return [
-    ...template.beforeMessages,
-    ...historyMessages.map(({ _createdAt, _externalId, ...message }) => message),
+    ...template.structuralMessages,
+    ...interleaveDepthSegments(template.depthSegments, fullHistory),
     ...template.afterMessages,
   ];
 }
 
+/**
+ * 把 depth 段插回历史：depth = d 表示「距离底部第 d 条」，即插在下标 total - d 之前。
+ * d 超过历史长度时贴到历史最上方（能给到的最接近位置）。
+ * 与小手机 lib/weixin-cloud-sync.ts 的同名函数是同一套规则，改一处要一起改。
+ */
+export function interleaveDepthSegments(segments, history) {
+  const total = history.length;
+  const buckets = new Map();
+  const ordered = (Array.isArray(segments) ? segments : [])
+    .filter(segment => Array.isArray(segment?.messages) && segment.messages.length > 0)
+    .sort((a, b) => (Number(b.depth) || 0) - (Number(a.depth) || 0));
+
+  for (const segment of ordered) {
+    const depth = Number(segment.depth) || 0;
+    const index = depth <= 0 ? total : (depth >= total ? 0 : total - depth);
+    const bucket = buckets.get(index) || [];
+    bucket.push(...segment.messages);
+    buckets.set(index, bucket);
+  }
+
+  const out = [];
+  for (let i = 0; i <= total; i += 1) {
+    const bucket = buckets.get(i);
+    if (bucket) out.push(...bucket);
+    if (i < total) out.push(history[i]);
+  }
+  return out;
+}
+
+/** 与小手机 llm-prompt-assembler 收尾的合并规则对齐：相邻同 role 的纯文本消息并成一条 */
+export function mergeAdjacentSameRoleMessages(messages) {
+  const out = [];
+  for (const message of messages) {
+    const prev = out[out.length - 1];
+    if (
+      prev
+      && prev.role === message.role
+      && prev.role !== "tool"
+      && typeof prev.content === "string"
+      && typeof message.content === "string"
+      && !prev.toolCalls?.length
+      && !message.toolCalls?.length
+    ) {
+      const merged = [prev.content, message.content].map(part => part.trim()).filter(Boolean).join("\n\n");
+      out[out.length - 1] = { ...prev, content: merged };
+      continue;
+    }
+    out.push(message);
+  }
+  return out;
+}
+
+/**
+ * 渲染历史消息：时间戳挂在正文前面，但相邻同 role 且时间戳相同的不再重复标注
+ * （对齐小手机 pushChronologicalShortTermBlocks 的 showTs 规则）——不然合并之后
+ * 一段里会连着出现好几行一模一样的时间。
+ */
+export function renderHistoryPromptMessages(collected) {
+  const out = [];
+  let prevTimestamp = "";
+  let prevRole = "";
+  for (const item of collected) {
+    const showTimestamp = Boolean(item._timestamp) && !(item._timestamp === prevTimestamp && item.role === prevRole);
+    prevTimestamp = item._timestamp;
+    prevRole = item.role;
+
+    const text = showTimestamp && item._text ? `${item._timestamp}\n${item._text}`
+      : showTimestamp ? item._timestamp
+      : item._text;
+    if (!text.trim() && !item._imageDataUrl) continue;
+
+    out.push({
+      role: item.role,
+      content: item._imageDataUrl
+        ? [
+          ...(text.trim() ? [{ type: "text", text }] : []),
+          { type: "image_url", image_url: { url: item._imageDataUrl, detail: "low" } },
+        ]
+        : text,
+    });
+  }
+  return out;
+}
+
 function cloudStoredMessageToPromptMessage(runtime, message, imageAttachments = new Map()) {
   const role = message.role === "assistant" ? "assistant" : message.role === "system" ? "system" : "user";
-  const content = formatCloudPromptMessageContent(runtime, message);
+  const text = String(message.content || "");
   const imageDataUrl = message.externalId ? imageAttachments.get(message.externalId) : undefined;
-  if (!content.trim() && !imageDataUrl) return null;
+  if (!text.trim() && !imageDataUrl) return null;
   return {
     role,
-    content: imageDataUrl
-      ? [
-        ...(content.trim() ? [{ type: "text", text: content }] : []),
-        { type: "image_url", image_url: { url: imageDataUrl, detail: "low" } },
-      ]
-      : content,
+    _text: text,
+    _timestamp: runtime.promptContext?.timeAware === true
+      ? formatPromptTimestamp(messageTime(message), runtime.promptContext)
+      : "",
+    _imageDataUrl: imageDataUrl,
     _createdAt: messageTime(message) || new Date().toISOString(),
     _externalId: message.externalId || "",
   };
 }
 
-function formatCloudPromptMessageContent(runtime, message) {
-  const content = String(message.content || "");
-  if (runtime.promptContext?.timeAware !== true) return content;
-  const ts = formatPromptTimestamp(messageTime(message));
-  return ts ? `${ts}\n${content}` : content;
-}
-
-function formatPromptTimestamp(value) {
+// 与小手机 lib/prompt-time.ts · formatPromptTimestamp 对齐。
+// 云函数跑在 UTC，必须按运行包下发的 promptTimeZone（用户设备时区）格式化，
+// 否则新微信消息的时间戳会和运行包里烘焙的历史时间戳差几个时区。
+// 老运行包没有该字段时退回运行环境本地时区，行为与改动前一致。
+export function formatPromptTimestamp(value, promptContext) {
   const date = new Date(value || "");
   if (Number.isNaN(date.getTime())) return "";
+  const timeZone = typeof promptContext?.promptTimeZone === "string" ? promptContext.promptTimeZone.trim() : "";
+  const zoneSuffix = timeZone && promptContext?.promptTimestampIncludeZone === true ? ` ${timeZone}` : "";
+  const parts = zonedDateParts(date, timeZone);
+  if (!parts) return "";
+  return `(${parts.year}-${parts.month}-${parts.day} ${parts.hour}:${parts.minute}${zoneSuffix})`;
+}
+
+function zonedDateParts(date, timeZone) {
   const pad = n => n < 10 ? `0${n}` : `${n}`;
-  return `(${date.getFullYear()}-${pad(date.getMonth() + 1)}-${pad(date.getDate())} ${pad(date.getHours())}:${pad(date.getMinutes())})`;
+  if (timeZone) {
+    try {
+      const formatter = new Intl.DateTimeFormat("en-US", {
+        timeZone,
+        year: "numeric", month: "2-digit", day: "2-digit",
+        hour: "2-digit", minute: "2-digit", hourCycle: "h23",
+      });
+      const out = {};
+      for (const part of formatter.formatToParts(date)) {
+        if (["year", "month", "day", "hour", "minute"].includes(part.type)) out[part.type] = part.value;
+      }
+      if (out.year && out.month && out.day && out.hour && out.minute) return out;
+    } catch {
+      // 时区名无效（老数据/手输）→ 落回运行环境本地时区
+    }
+  }
+  return {
+    year: `${date.getFullYear()}`,
+    month: pad(date.getMonth() + 1),
+    day: pad(date.getDate()),
+    hour: pad(date.getHours()),
+    minute: pad(date.getMinutes()),
+  };
 }
 
 function buildChatCompletionRequest(apiConfig, preset, messages) {
@@ -629,7 +754,7 @@ function buildChatCompletionsUrl(baseUrl) {
   return baseUrl.endsWith("/chat/completions") ? baseUrl : `${baseUrl.replace(/\/+$/, "")}/chat/completions`;
 }
 
-function normalizeLlmMessages(messages) {
+export function normalizeLlmMessages(messages) {
   return messages
     .map(message => {
       const role = message?.role === "assistant" ? "assistant" : message?.role === "system" ? "system" : "user";
@@ -674,10 +799,14 @@ function extractOpenAiCompatibleText(data) {
   return "";
 }
 
-function cleanReplyText(text) {
+// 时间戳剥离必须与小手机同款（lib/api-helpers.ts · stripHallucinatedTimestamps）：
+// 括号内以完整日期时间开头的一律剥掉，兼容带秒、带时区/星期尾巴与全角括号。
+// 旧版只认半角、不带尾巴的 (YYYY-MM-DD HH:MM)，而运行包烘焙的历史时间戳在
+// 角色时区与系统时区不同时带时区名，模型照抄后一条都拦不住。
+export function cleanReplyText(text) {
   return String(text || "")
     .replace(/<think>[\s\S]*?<\/think>/gi, "")
-    .replace(/\(\d{4}-\d{2}-\d{2}\s+\d{2}:\d{2}\)\s*/g, "")
+    .replace(/[（(]\d{4}-\d{2}-\d{2}\s+\d{2}:\d{2}(?::\d{2})?(?:\s+[^)）]*)?[)）]\s*/g, "")
     .replace(/\(system\s*time\s*[:：][^)]*\)\s*/gi, "")
     .trim();
 }
@@ -1689,20 +1818,31 @@ const CLOUD_CORE_CODE_PATH = "weixin-cloud/function-core.mjs";
 
 // ── 自更新加载器 ──
 // 小手机同步运行包时会把最新的 assistant-core.mjs 上传到桶里；这里每次运行
-// 优先动态加载桶里的核心逻辑（60 秒内存缓存），失败则回退到本文件内置的
-// 拼接版本。这样部署一次之后，后续逻辑更新随小手机同步自动生效，
-// 用户无需再到 Supabase 里改代码。
+// 优先动态加载桶里的核心逻辑，失败则回退到本文件内置的拼接版本。
+// 这样部署一次之后，后续逻辑更新随小手机同步自动生效，用户无需再到
+// Supabase 里改代码。
+// 配额注意：核心文件约 80KB，无脑重拉会烧掉用户免费档 egress（84KB × 每分钟
+// ≈ 3.5GB/月）。这里 5 分钟内直接用内存缓存；过期后带 If-None-Match 条件请求，
+// 未变更时 304 响应几乎零流量。自更新最坏晚 5 分钟生效。
 let cachedBucketCore = null;
 let cachedBucketCoreAt = 0;
+let cachedBucketCoreEtag = "";
+const BUCKET_CORE_TTL_MS = 5 * 60 * 1000;
 
 async function loadBucketCore(env) {
   const now = Date.now();
-  if (cachedBucketCore && now - cachedBucketCoreAt < 60_000) return cachedBucketCore;
+  if (cachedBucketCore && now - cachedBucketCoreAt < BUCKET_CORE_TTL_MS) return cachedBucketCore;
   try {
+    const headers = { ...supabaseHeaders(env) };
+    if (cachedBucketCore && cachedBucketCoreEtag) headers["If-None-Match"] = cachedBucketCoreEtag;
     const res = await fetch(storageObjectUrl(env, CLOUD_CORE_CODE_PATH), {
-      headers: supabaseHeaders(env),
+      headers,
       cache: "no-store",
     });
+    if (res.status === 304 && cachedBucketCore) {
+      cachedBucketCoreAt = now;
+      return cachedBucketCore;
+    }
     if (!res.ok) return null;
     const code = await res.text();
     if (!code.includes("export async function pollOnce")) return null;
@@ -1715,6 +1855,7 @@ async function loadBucketCore(env) {
     if (typeof mod.pollOnce !== "function" || typeof mod.setMediaReplyEnabled !== "function") return null;
     cachedBucketCore = mod;
     cachedBucketCoreAt = now;
+    cachedBucketCoreEtag = res.headers.get("etag") || "";
     return mod;
   } catch {
     return null;
@@ -1724,6 +1865,12 @@ async function loadBucketCore(env) {
 // 收尾动作（状态回写/心跳/响应），把尽量多的时间让给 LLM 与媒体生成，
 // 减少"预算不足降级模板卡"的频率；各环节的内层预留见 assistant-core。
 const CLOUD_POLL_BUDGET_MS = 140_000;
+
+// mode=loop 子轮询：cron 每分钟触发一次，函数内部隔 ~12 秒再拉几轮，
+// 体验等同旧的 10 秒 cron，调用次数只有 1/6。窗口只占前 50 秒，
+// 生成长回复时循环自然让位（每轮开始前检查剩余窗口）。
+const CLOUD_LOOP_WINDOW_MS = 50_000;
+const CLOUD_LOOP_INTERVAL_MS = 12_000;
 
 const CLOUD_CORS_HEADERS = {
   "Access-Control-Allow-Origin": "*",
@@ -1752,11 +1899,29 @@ function buildCloudEnv(body) {
   };
 }
 
+// 部署密钥 10 分钟内存缓存：它只在用户重新生成密钥时才变，不值得每轮回源。
+// 校验失败时穿透缓存重取一次，保证换钥后旧实例最多多打一次 Storage 就能跟上。
+let cachedCronSecret = "";
+let cachedCronSecretAt = 0;
+const CRON_SECRET_TTL_MS = 10 * 60 * 1000;
+
+async function loadCronSecret(env, force = false) {
+  const now = Date.now();
+  if (!force && cachedCronSecret && now - cachedCronSecretAt < CRON_SECRET_TTL_MS) return cachedCronSecret;
+  const secret = await getObjectJson(env, CLOUD_CRON_SECRET_PATH).catch(() => null);
+  const token = typeof secret?.token === "string" ? secret.token.trim() : "";
+  if (token) {
+    cachedCronSecret = token;
+    cachedCronSecretAt = now;
+  }
+  return token;
+}
+
 async function verifyCloudCronToken(env, body) {
   const provided = typeof body?.token === "string" ? body.token.trim() : "";
   if (!provided) return { ok: false, status: 401, error: "missing_token" };
-  const secret = await getObjectJson(env, CLOUD_CRON_SECRET_PATH).catch(() => null);
-  const expected = typeof secret?.token === "string" ? secret.token.trim() : "";
+  let expected = await loadCronSecret(env);
+  if (expected && provided !== expected) expected = await loadCronSecret(env, true);
   if (!expected) {
     return { ok: false, status: 500, error: "missing_cron_secret: 云端还没有部署密钥，请回到小手机微信设置重新复制定时 SQL。" };
   }
@@ -1782,18 +1947,27 @@ async function runCloudScheduleAction(env, action) {
       const functionUrl = `${env.SUPABASE_URL.replace(/\/+$/, "")}/functions/v1/weixin-assistant`;
       await sql.unsafe("create extension if not exists pg_cron");
       await sql.unsafe("create extension if not exists pg_net");
-      await sql.unsafe(`select cron.schedule('${CLOUD_CRON_JOB_NAME}', '10 seconds', $CRON$
+      // 每分钟触发一次、函数内部按 ~12 秒子轮询（mode=loop）：回复延迟与旧的
+      // 10 秒 cron 基本一致，但 Edge Function 调用次数降到 1/6（约 4.3 万次/月，
+      // 免费档 50 万次的 9%）。timeout 只是 pg_net 等待响应的上限，函数照常跑完。
+      await sql.unsafe(`select cron.schedule('${CLOUD_CRON_JOB_NAME}', '1 minute', $CRON$
   select net.http_post(
     url     := '${functionUrl}',
     headers := jsonb_build_object('Content-Type', 'application/json'),
-    body    := jsonb_build_object('token', '${token}', 'bucket', '${env.SUPABASE_BUCKET}'),
+    body    := jsonb_build_object('token', '${token}', 'bucket', '${env.SUPABASE_BUCKET}', 'mode', 'loop'),
     timeout_milliseconds := 8000
   );
+$CRON$)`);
+      // pg_cron 每次运行都会往 cron.job_run_details 记一行，长期不清会蚕食免费档
+      // 500MB 数据库容量；挂一个每天一次的清理任务，只留最近 3 天。
+      await sql.unsafe(`select cron.schedule('${CLOUD_CRON_JOB_NAME}-cleanup', '0 3 * * *', $CRON$
+  delete from cron.job_run_details where end_time < now() - interval '3 days';
 $CRON$)`);
       return { scheduled: true };
     }
     if (action === "disable") {
       await sql.unsafe(`select cron.unschedule('${CLOUD_CRON_JOB_NAME}')`).catch(() => {});
+      await sql.unsafe(`select cron.unschedule('${CLOUD_CRON_JOB_NAME}-cleanup')`).catch(() => {});
       return { scheduled: false };
     }
     const rows = await sql.unsafe(`select active from cron.job where jobname = '${CLOUD_CRON_JOB_NAME}'`);
@@ -1852,32 +2026,53 @@ Deno.serve(async (req) => {
 
   const startedAt = Date.now();
   const targetBotId = typeof body?.bot === "string" && body.bot.trim() ? body.bot.trim() : undefined;
+  const loopMode = body?.mode === "loop";
   try {
-    const result = await core.pollOnce(env, targetBotId, {
-      deadlineAt: startedAt + CLOUD_POLL_BUDGET_MS,
-      debug: body?.debug === true,
-    });
-    const rows = Array.isArray(result?.results) ? result.results : [];
+    let iterations = 0;
+    let lastRows = [];
+    let received = 0, stored = 0, sent = 0, skippedForDeadline = 0;
+    let firstError;
+    for (;;) {
+      iterations += 1;
+      const result = await core.pollOnce(env, targetBotId, {
+        deadlineAt: startedAt + CLOUD_POLL_BUDGET_MS,
+        debug: body?.debug === true,
+      });
+      const rows = Array.isArray(result?.results) ? result.results : [];
+      lastRows = rows.length > 0 ? rows : lastRows;
+      received += rows.reduce((sum, row) => sum + Number(row.received || 0), 0);
+      stored += rows.reduce((sum, row) => sum + Number(row.stored || 0), 0);
+      sent += rows.reduce((sum, row) => sum + Number(row.autoReply?.sent || 0), 0);
+      skippedForDeadline += Number(result?.skippedForDeadline || 0);
+      firstError = firstError || rows.map(row =>
+        row.autoReply?.error
+        || (row.tokenExpired ? "Token 已过期，请重新扫码" : "")
+        || (row.ilinkErrorCode !== undefined ? `iLink error_code ${row.ilinkErrorCode}` : ""),
+      ).find(Boolean);
+      if (!loopMode) break;
+      const nextAt = startedAt + iterations * CLOUD_LOOP_INTERVAL_MS;
+      if (nextAt - startedAt >= CLOUD_LOOP_WINDOW_MS) break;
+      const waitMs = nextAt - Date.now();
+      if (waitMs > 0) await new Promise(resolve => setTimeout(resolve, waitMs));
+      if (Date.now() - startedAt >= CLOUD_LOOP_WINDOW_MS) break;
+    }
     const summary = {
-      polled: rows.length,
-      received: rows.reduce((sum, row) => sum + Number(row.received || 0), 0),
-      stored: rows.reduce((sum, row) => sum + Number(row.stored || 0), 0),
-      sent: rows.reduce((sum, row) => sum + Number(row.autoReply?.sent || 0), 0),
-      skippedForDeadline: Number(result?.skippedForDeadline || 0),
+      polled: lastRows.length,
+      received,
+      stored,
+      sent,
+      skippedForDeadline,
+      iterations,
       elapsedMs: Date.now() - startedAt,
       codeSource: bucketCore ? "bucket" : "bundled",
-      bots: rows.map(row => ({
+      bots: lastRows.map(row => ({
         botId: row.botId,
         characterId: row.characterId,
         received: row.received,
         ilinkErrorCode: row.ilinkErrorCode,
         autoReplyStatus: row.autoReply?.status,
       })),
-      error: rows.map(row =>
-        row.autoReply?.error
-        || (row.tokenExpired ? "Token 已过期，请重新扫码" : "")
-        || (row.ilinkErrorCode !== undefined ? `iLink error_code ${row.ilinkErrorCode}` : ""),
-      ).find(Boolean),
+      error: firstError,
     };
     console.log(`[weixin-assistant] ${JSON.stringify(summary)}`);
     await writeCloudHeartbeat(env, {

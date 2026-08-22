@@ -88,6 +88,10 @@ export interface AssemblerInput {
     groupTools?: string;                     // formatted tool definitions for {{groupTools}} macro (group chat)
     customAppRichMediaDirectives?: string;   // formatted custom app rich-media directives
     chatBilingualInstruction?: string;       // session-specific bilingual output rule for {{chatBilingualInstruction}}
+    statusRegionSection?: string;            // {{statusRegionSection}} — 状态区章节（native 原文 / 空 / 自定义契约）
+    statusRegionExampleLine?: string;        // {{statusRegionExampleLine}} — 主动消息输出示例中的状态区行
+    statusRegionComposition?: string;        // {{statusRegionComposition}} — 文字聊天模式【输出构成】行
+    statusRegionFullExample?: string;        // {{statusRegionFullExample}} — 完整示例中的状态值+内心行
     offlineBilingualInstruction?: string;    // offline-mode bilingual output rule for {{offlineBilingualInstruction}}
     offlineSummaryTag?: string;              // XML tag used for offline-mode summary output
     checkPhoneBilingualInstruction?: string; // checkphone bilingual output rule for {{checkPhoneBilingualInstruction}}
@@ -297,13 +301,6 @@ function applyTimeContextToMacroEngine(engine: MacroEngine, timeContext: Charact
 function normalizeRole(role: string): LLMMessageRole {
     if (role === "user" || role === "assistant" || role === "system") return role;
     return "system";
-}
-
-// ── Helper: replace {{char}}/{{user}} in character fields ──
-function substituteCharUser(text: string, charName: string, userName: string): string {
-    return text
-        .replace(/\{\{char\}\}/gi, charName)
-        .replace(/\{\{user\}\}/gi, userName);
 }
 
 // ── Helper: build user persona text ──
@@ -601,9 +598,9 @@ function isWBAtDepthPosition(entry: WorldBookEntry): boolean {
 
 /**
  * Core Engine: Assembles the final LLM payload array using Depth and Order injection rules.
- * When a preset has prompt_order, uses macro expansion, prompt_order
- * sorting, RELATIVE/ABSOLUTE injection_position classification, and marker-based placement.
- * Otherwise falls back to the legacy hardcoded assembly path.
+ * 完全由预设驱动：宏展开、prompt_order（缺失时按 prompts 数组顺序）、
+ * RELATIVE/ABSOLUTE injection_position 分类、标记条目定位。
+ * 预设里没有的东西一律不注入——不存在人设/世界书/记忆的硬编码兜底。
  */
 export function assemblePromptPayload(input: AssemblerInput): LLMMessage[] {
     const { character, history, preset, worldBooks, regexes, userIdentity, userName = "User",
@@ -621,25 +618,12 @@ export function assemblePromptPayload(input: AssemblerInput): LLMMessage[] {
     const periodCareContext = input.periodCareContext ?? "";
     const resolvedUserName = userIdentity?.name || userName;
     const blocks: PromptBlock[] = [];
-    const hasPromptOrder = !!(preset?.prompt_order && preset.prompt_order.length > 0);
     const timeAware = resolveTimeAware(input.timeAware);
     const promptTimeContext = input.timeContext ?? buildCharacterTimeContext(character.timeZone);
     const promptTimestampOptions = input.promptTimestampOptions
         ?? getPromptTimestampOptionsForTimeContext(promptTimeContext);
 
-    // --- HIGH-LEVEL ROLEPLAY CONTEXT (legacy path only) ---
-    // In prompt_order mode, the preset itself defines the opening prompt structure.
-    if (!hasPromptOrder) {
-        blocks.push({
-            text: `# [System: Roleplay Context]`,
-            role: "system",
-            depth: 999,
-            order: 0,
-            marker: "Section: Roleplay Context"
-        });
-    }
-
-    // --- World Book keyword activation (shared by both paths) ---
+    // --- World Book keyword activation ---
     const recentHistoryStr = input.worldBookActivationContext
         ?? history.slice(-10).map(m => m.content).join("\n");
     const activatedWBEntries: WorldBookEntry[] = [];
@@ -656,9 +640,12 @@ export function assemblePromptPayload(input: AssemblerInput): LLMMessage[] {
     const latestStateValues = input.initialStateValues ?? findLatestStateValues(history);
     const stateStr = formatStateValuesForPrompt(latestStateValues);
 
-    if (hasPromptOrder) {
+    if (preset) {
         // ════════════════════════════════════════════════════════
-        // PROMPT_ORDER DRIVEN PATH
+        // PRESET DRIVEN PATH —— 所设即所得
+        // 预设里有什么条目就注入什么，没有 prompt_order 时按 prompts
+        // 数组顺序处理（与预设管理界面看到的顺序一致）。这里不做任何
+        // 人设/世界书/记忆的硬编码兜底。
         // ════════════════════════════════════════════════════════
 
         const engine = new MacroEngine(character.name, resolvedUserName);
@@ -692,6 +679,10 @@ export function assemblePromptPayload(input: AssemblerInput): LLMMessage[] {
         engine.groupTools = input.groupTools ?? "";
         engine.customAppRichMediaDirectives = input.customAppRichMediaDirectives ?? "";
         engine.chatBilingualInstruction = input.chatBilingualInstruction ?? "";
+        engine.statusRegionSection = input.statusRegionSection ?? "";
+        engine.statusRegionExampleLine = input.statusRegionExampleLine ?? "";
+        engine.statusRegionComposition = input.statusRegionComposition ?? "";
+        engine.statusRegionFullExample = input.statusRegionFullExample ?? "";
         engine.offlineBilingualInstruction = input.offlineBilingualInstruction ?? "";
         engine.offlineSummaryTag = input.offlineSummaryTag ?? "summary";
         engine.checkPhoneBilingualInstruction = input.checkPhoneBilingualInstruction ?? "";
@@ -878,189 +869,6 @@ export function assemblePromptPayload(input: AssemblerInput): LLMMessage[] {
             });
         });
 
-    } else {
-        // ════════════════════════════════════════════════════════
-        // LEGACY HARDCODED PATH (no prompt_order)
-        // ════════════════════════════════════════════════════════
-
-        // 1. Character Persona (substitute {{char}}/{{user}} in character fields)
-        const sub = (t: string) => substituteCharUser(t, character.name, resolvedUserName);
-        blocks.push({
-            text: `## [Character Persona]\nYou are ${character.name}.\n${sub(character.persona)}`,
-            role: "system",
-            depth: 998,
-            order: 10,
-            marker: "Character Persona"
-        });
-
-        if (character.personality?.trim()) {
-            blocks.push({
-                text: `## [Character Personality]\n${sub(character.personality)}`,
-                role: "system",
-                depth: 998,
-                order: 11,
-                marker: "Character Personality"
-            });
-        }
-
-        // 3. User Identity (before worldbook-before and character data)
-        {
-            const userPersonaText = buildUserPersonaText(userIdentity, resolvedUserName);
-            blocks.push({
-                text: `## [User Persona]\n${userPersonaText}`,
-                role: "system",
-                depth: 999,
-                order: 5,
-                marker: "User Persona"
-            });
-        }
-
-        // 4. Preset Prompts (with macro expansion for {{char}}/{{user}} etc.)
-        let hasPresets = false;
-        if (preset && preset.prompts) {
-            const engine = new MacroEngine(character.name, resolvedUserName);
-            applyTimeContextToMacroEngine(engine, promptTimeContext);
-            engine.lastUserMessage = history.filter(m => m.role === "user").pop()?.content ?? "";
-            engine.lastCharMessage = history.filter(m => m.role === "assistant").pop()?.content ?? "";
-            engine.lastMessage = history.length > 0 ? history[history.length - 1].content : "";
-            engine.description = character.persona ?? "";
-            engine.personality = character.personality ?? "";
-            engine.persona = userIdentity?.bio ?? "";
-            engine.stateStr = stateStr;
-            engine.followUpCount = followUpCount;
-            engine.followUpDelay = followUpDelay;
-            engine.timedWakeElapsedMinutes = String(timedWakeElapsedMinutes);
-            engine.timedWakeIntent = timedWakeIntent;
-            engine.periodCareContext = periodCareContext;
-            engine.customStickerNames = input.customStickerNames ?? "";
-        engine.customStickerExample = input.customStickerExample ?? "";
-        engine.musicLocal = input.musicLocal ?? "";
-        engine.musicCloud = input.musicCloud ?? "";
-        engine.musicOnlineHint = input.musicOnlineHint ?? "";
-        engine.currentSchedule = input.currentSchedule ?? "";
-        engine.tools = input.tools ?? "";
-        engine.cocreateWriteActions = input.cocreateWriteActions ?? "";
-        engine.cocreateReadActions = input.cocreateReadActions ?? "";
-        engine.groupTools = input.groupTools ?? "";
-        engine.customAppRichMediaDirectives = input.customAppRichMediaDirectives ?? "";
-        engine.chatBilingualInstruction = input.chatBilingualInstruction ?? "";
-        engine.offlineBilingualInstruction = input.offlineBilingualInstruction ?? "";
-        engine.offlineSummaryTag = input.offlineSummaryTag ?? "summary";
-        engine.checkPhoneBilingualInstruction = input.checkPhoneBilingualInstruction ?? "";
-        engine.xiaohongshuBilingualInstruction = input.xiaohongshuBilingualInstruction ?? "";
-        engine.phoneAppId = input.phoneAppId ?? "";
-        engine.phoneAppLabel = input.phoneAppLabel ?? "";
-        engine.phoneSnapshotSummary = input.phoneSnapshotSummary ?? "";
-        engine.phoneLastRefreshAt = input.phoneLastRefreshAt ?? "";
-        engine.dwellingRoom = input.dwellingRoom ?? "";
-        engine.dwellingFurniture = input.dwellingFurniture ?? "";
-        engine.dwellingItem = input.dwellingItem ?? "";
-        engine.dwellingItemPreview = input.dwellingItemPreview ?? "";
-        engine.noteWallContext = input.noteWallContext ?? "";
-        engine.diaryEntryContext = input.diaryEntryContext ?? "";
-        engine.xiaohongshuFeedContext = input.xiaohongshuFeedContext ?? "";
-        engine.xiaohongshuUserPostContext = input.xiaohongshuUserPostContext ?? "";
-        engine.xiaohongshuCommentContext = input.xiaohongshuCommentContext ?? "";
-        engine.xiaohongshuMentionContext = input.xiaohongshuMentionContext ?? "";
-            engine.interviewTheme = input.interviewTheme ?? "";
-            engine.interviewHostName = input.interviewHostName ?? "";
-            engine.interviewGuests = input.interviewGuests ?? "";
-            engine.interviewGuestCount = input.interviewGuestCount ?? "";
-            engine.interviewCurrentGuest = input.interviewCurrentGuest ?? "";
-            engine.interviewOtherGuests = input.interviewOtherGuests ?? "";
-            engine.interviewQuestion = input.interviewQuestion ?? "";
-        engine.interviewTranscript = input.interviewTranscript ?? "";
-        engine.interviewPhase = input.interviewPhase ?? "";
-        engine.interviewRound = input.interviewRound ?? "";
-        engine.interviewUserAnswer = input.interviewUserAnswer ?? "";
-        engine.interviewCharacterAnswerHistory = input.interviewCharacterAnswerHistory ?? "";
-        engine.cocreateProjectContext = input.cocreateProjectContext ?? "";
-        engine.cocreateCurrentMode = input.cocreateCurrentMode ?? "";
-        engine.cocreateCurrentChapter = input.cocreateCurrentChapter ?? "";
-        engine.cocreateChapterIndex = input.cocreateChapterIndex ?? "";
-        engine.cocreateArchivedChapterContext = input.cocreateArchivedChapterContext ?? "";
-
-            preset.prompts.forEach((p, idx) => {
-                if (p.enabled && !p.marker) {
-                    let content = engine.expand(p.content);
-                    content = postProcessTrim(content).trim();
-                    if (!content) return;
-                    hasPresets = true;
-                    blocks.push({
-                        text: content,
-                        role: normalizeRole(p.role),
-                        depth: p.injection_depth ?? 996,
-                        order: 50 + idx,
-                        marker: p.name || `Preset Prompt ${idx}`
-                    });
-                }
-            });
-        }
-
-        if (hasPresets) {
-            blocks.push({
-                text: `## [Scenario & Presets]`,
-                role: "system",
-                depth: 996,
-                order: 40,
-                marker: "Section: Presets"
-            });
-        }
-
-        // 5. World Book entries (apply placement=5 regex to each entry)
-        let hasWorldBooks = false;
-        activatedWBEntries.forEach(entry => {
-            hasWorldBooks = true;
-            const resolvedDepth = resolveWorldBookDepth(entry);
-            blocks.push({
-                text: applyWorldInfoRegex(sub(entry.content), regexes),
-                role: entry.role === 1 ? "user" : (entry.role === 2 ? "assistant" : "system"),
-                depth: resolvedDepth,
-                order: entry.insertion_order ?? 50,
-                marker: `WB: ${entry.key}`
-            });
-        });
-
-        if (hasWorldBooks) {
-            blocks.push({
-                text: `## [World Lore & Events]`,
-                role: "system",
-                depth: 995,
-                order: 40,
-                marker: "Section: World Lore"
-            });
-        }
-
-        // 5b. Long-term memories (before chat history, depth 997)
-        if (scheduleSummary?.trim()) {
-            blocks.push({
-                text: scheduleSummary,
-                role: "system",
-                depth: 997,
-                order: 54,
-                marker: "calendarSchedule"
-            });
-        }
-
-        if (coreMemories?.trim()) {
-            blocks.push({
-                text: coreMemories,
-                role: "system",
-                depth: 997,
-                order: 55,
-                marker: "memoryCore"
-            });
-        }
-
-        if (longTermMemories?.trim()) {
-            blocks.push({
-                text: longTermMemories,
-                role: "system",
-                depth: 997,
-                order: 60,
-                marker: "memoryLongTerm"
-            });
-        }
     }
 
     // --- CHAT HISTORY / SHORT-TERM MEMORY ---
@@ -1074,15 +882,6 @@ export function assemblePromptPayload(input: AssemblerInput): LLMMessage[] {
     const historyInjectionEnabled = !preset
         || (historyMarkerPrompt ? isPromptEnabled(historyMarkerPrompt, preset.prompt_order) : false);
     const useChronologicalShortTerm = Boolean(input.unifiedRecentItems && input.unifiedRecentItems.length > 0);
-    if (!hasPromptOrder) {
-        blocks.push({
-            text: `# [System: Chat History]`,
-            role: "system",
-            depth: (useChronologicalShortTerm ? input.unifiedRecentItems!.length : history.length) + 2,
-            order: 999,
-            marker: "Section: Chat History"
-        });
-    }
 
     if (!historyInjectionEnabled) {
         // 历史注入被关闭：不输出 <shortTermMemory>、近期动态与聊天记录
@@ -1098,7 +897,7 @@ export function assemblePromptPayload(input: AssemblerInput): LLMMessage[] {
             visionEnabled: input.enableVision === true,
             nativeToolHistory: input.nativeToolHistory === true,
         });
-    } else if (hasPromptOrder) {
+    } else if (preset) {
         // Wrap chat history section in XML tags with per-feature recent blocks
         const rb = input.recentBlocks ?? [];
         const lastBlock = rb.length > 0 ? rb[rb.length - 1] : null;
@@ -1244,17 +1043,16 @@ export function assemblePromptPayload(input: AssemblerInput): LLMMessage[] {
     });
 
     // --- Aggregate into final LLM messages ---
-    // When using prompt_order, only merge adjacent history messages.
-    // Preset entries intentionally use role alternation and should not be merged.
+    // 走预设时只合并相邻的历史消息：预设条目本来就靠 role 交替表达结构，不能合。
     const finalPayload: LLMMessage[] = [];
     blocks.forEach(b => {
         const inputCtx: RegexContext = b.fromHistory
-            ? { depth: b.depth, activeTags }
+            ? { depth: b.depth, activeTags, history: true }
             : { activeTags };
         const processedText = b.role === "tool" ? b.text : applyInputRegex(b.text, regexes, inputCtx);
         const carriesNativeToolData = b.role === "tool" || Boolean(b.toolCalls?.length);
 
-        const canMerge = hasPromptOrder
+        const canMerge = preset
             ? (b.fromHistory && finalPayload.length > 0 &&
                finalPayload[finalPayload.length - 1].role === b.role &&
                finalPayload[finalPayload.length - 1]._debugMeta?._fromHistory === true &&
@@ -1540,6 +1338,7 @@ export type RegexContext = {
     isEdit?: boolean;        // true when user is editing a message
     depth?: number;          // message depth (0 = latest)
     activeTags?: string[];   // current app tags used for tag-scoped rule filtering
+    history?: boolean;       // true when the block is a chat history message (historyOnly rules only fire here)
     macroEngine?: MacroEngine;  // for {{char}} etc. in findRegex & replaceString
 };
 
@@ -1662,6 +1461,8 @@ function shouldRunRule(
     if (rule.disabled) return false;
     if (!rule.placement?.includes(placement)) return false;
     if (!matchesActiveTags(rule.tags, ctx.activeTags ?? [])) return false;
+    // historyOnly gate: only fire on chat history message blocks
+    if (rule.historyOnly === true && ctx.history !== true) return false;
 
     // markdownOnly / promptOnly / default filtering
     const { isMarkdown = false, isPrompt = false, isEdit = false, depth } = ctx;
@@ -1793,6 +1594,10 @@ export interface GroupAssemblerInput {
     groupRoster?: string;
     customAppRichMediaDirectives?: string;
     chatBilingualInstruction?: string;
+    statusRegionSection?: string;
+    statusRegionExampleLine?: string;
+    statusRegionComposition?: string;
+    statusRegionFullExample?: string;
     offlineBilingualInstruction?: string;
     offlineSummaryTag?: string;
     checkPhoneBilingualInstruction?: string;
@@ -1924,7 +1729,6 @@ export function assembleGroupPromptPayload(input: GroupAssemblerInput): LLMMessa
     const activeTags = input.appTags ? [...input.appTags] : ["group_chat"];
     const resolvedUserName = userIdentity?.name || userName;
     const blocks: PromptBlock[] = [];
-    const hasPromptOrder = !!(preset?.prompt_order && preset.prompt_order.length > 0);
     const timeAware = resolveTimeAware(input.timeAware);
     const groupTimeContext = input.timeContext
         ?? buildGroupTimeContext(members.map(member => ({
@@ -2017,7 +1821,7 @@ export function assembleGroupPromptPayload(input: GroupAssemblerInput): LLMMessa
     }
 
     // 2. Per-member <member> blocks — preset-driven marker iteration
-    const processingOrder = hasPromptOrder ? buildProcessingOrder(preset!) : [];
+    const processingOrder = preset ? buildProcessingOrder(preset) : [];
 
     for (const m of members) {
         const char = m.character;
@@ -2045,6 +1849,10 @@ export function assembleGroupPromptPayload(input: GroupAssemblerInput): LLMMessa
         engine.groupTools = input.groupTools ?? "";
         engine.groupRoster = input.groupRoster ?? "";
         engine.chatBilingualInstruction = input.chatBilingualInstruction ?? "";
+        engine.statusRegionSection = input.statusRegionSection ?? "";
+        engine.statusRegionExampleLine = input.statusRegionExampleLine ?? "";
+        engine.statusRegionComposition = input.statusRegionComposition ?? "";
+        engine.statusRegionFullExample = input.statusRegionFullExample ?? "";
         engine.offlineBilingualInstruction = input.offlineBilingualInstruction ?? "";
         engine.offlineSummaryTag = input.offlineSummaryTag ?? "summary";
         engine.checkPhoneBilingualInstruction = input.checkPhoneBilingualInstruction ?? "";
@@ -2071,7 +1879,7 @@ export function assembleGroupPromptPayload(input: GroupAssemblerInput): LLMMessa
         // Build member content by iterating preset markers in order
         const sections: string[] = [];
 
-        if (hasPromptOrder) {
+        if (preset) {
             for (const p of processingOrder) {
                 if (!isPromptEnabled(p, preset!.prompt_order)) continue;
                 if (!p.marker) continue; // only process markers inside member blocks
@@ -2102,21 +1910,6 @@ export function assembleGroupPromptPayload(input: GroupAssemblerInput): LLMMessa
                     }
                 }
             }
-        } else {
-            // Legacy fallback: hardcoded order
-            if (wbBeforeEntries.length > 0) {
-                const sorted = [...wbBeforeEntries].sort((a, b) => (a.insertion_order ?? 50) - (b.insertion_order ?? 50));
-                sections.push(engine.expand(sorted.map(e => applyWorldInfoRegex(e.content, regexes, { macroEngine: engine, activeTags })).join("\n\n")));
-            }
-            sections.push(engine.expand(`You are ${char.name}.\n${char.persona}`));
-            if (char.personality?.trim()) sections.push(engine.expand(char.personality));
-            if (wbAfterEntries.length > 0) {
-                const sorted = [...wbAfterEntries].sort((a, b) => (a.insertion_order ?? 50) - (b.insertion_order ?? 50));
-                sections.push(engine.expand(sorted.map(e => applyWorldInfoRegex(e.content, regexes, { macroEngine: engine, activeTags })).join("\n\n")));
-            }
-            if (m.scheduleSummary?.trim()) sections.push(m.scheduleSummary);
-            if (m.coreMemories?.trim()) sections.push(m.coreMemories);
-            if (m.longTermMemories?.trim()) sections.push(m.longTermMemories);
         }
 
         const stateSection = [
@@ -2162,7 +1955,7 @@ export function assembleGroupPromptPayload(input: GroupAssemblerInput): LLMMessa
     }
 
     // 3. Feature-tagged prompts from preset
-    if (hasPromptOrder) {
+    if (preset) {
         const memberNameStr = memberNames || members.map(m => m.character.name).join("、");
 
         // Create a macro engine for group-level prompts ({{char}} = all member names)
@@ -2188,6 +1981,12 @@ export function assembleGroupPromptPayload(input: GroupAssemblerInput): LLMMessa
         groupEngine.groupRoster = input.groupRoster ?? "";
         groupEngine.customAppRichMediaDirectives = input.customAppRichMediaDirectives ?? "";
         groupEngine.chatBilingualInstruction = input.chatBilingualInstruction ?? "";
+        // 状态区四宏：群聊的输出格式条目是全群共享的，之前只给了 <member> 块内的引擎，
+        // 共享条目里的 {{statusRegionSection}} 会解析成空串——群聊的状态值/内心章节整段消失。
+        groupEngine.statusRegionSection = input.statusRegionSection ?? "";
+        groupEngine.statusRegionExampleLine = input.statusRegionExampleLine ?? "";
+        groupEngine.statusRegionComposition = input.statusRegionComposition ?? "";
+        groupEngine.statusRegionFullExample = input.statusRegionFullExample ?? "";
         groupEngine.offlineBilingualInstruction = input.offlineBilingualInstruction ?? "";
         groupEngine.offlineSummaryTag = input.offlineSummaryTag ?? "summary";
 
@@ -2399,7 +2198,7 @@ export function assembleGroupPromptPayload(input: GroupAssemblerInput): LLMMessa
     const finalPayload: LLMMessage[] = [];
     blocks.forEach(b => {
         const inputCtx: RegexContext = b.fromHistory
-            ? { depth: b.depth, activeTags }
+            ? { depth: b.depth, activeTags, history: true }
             : { activeTags };
         const processedText = b.role === "tool" ? b.text : applyInputRegex(b.text, regexes, inputCtx);
         const carriesNativeToolData = b.role === "tool" || Boolean(b.toolCalls?.length);

@@ -1187,16 +1187,28 @@ export function attachMomentPhotoInBackground(
     void (async () => {
         let photoUrl: string | undefined;
         let errorMessage: string | undefined;
+        let aborted = false;
         try {
             photoUrl = await generateMomentPhotoUrl(description, characterId, useReferenceImage, signal);
         } catch (error) {
+            aborted = isAbortError(error);
             errorMessage = error instanceof Error ? error.message : String(error);
         }
+        const reason = errorMessage || "生图配置未启用或生成失败";
         updateMomentPost(postId, photoUrl
             ? { photoUrl, photoGenerationStatus: "generated", photoGenerationError: undefined }
-            : { photoGenerationStatus: "failed", photoGenerationError: errorMessage || "生图配置未启用或生成失败" });
+            : { photoGenerationStatus: "failed", photoGenerationError: reason });
         dispatchMomentsUpdated();
+        // 失败时只在当下弹一次提示（卡片上不再挂红字），中断不算失败
+        if (!photoUrl && !aborted) dispatchMomentPhotoGenerationFailed(reason);
     })();
+}
+
+export const MOMENT_PHOTO_GENERATION_FAILED_EVENT = "moment-photo-generation-failed";
+
+function dispatchMomentPhotoGenerationFailed(message: string): void {
+    if (typeof window === "undefined") return;
+    window.dispatchEvent(new CustomEvent(MOMENT_PHOTO_GENERATION_FAILED_EVENT, { detail: { message } }));
 }
 
 export async function generateMomentPhotoUrl(

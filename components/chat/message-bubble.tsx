@@ -4,7 +4,7 @@ import { useState, useEffect, useCallback, useRef, useMemo, memo } from "react";
 import { findCustomStickerByName, resolveCustomStickerUrl } from "@/lib/custom-sticker-storage";
 import { isMediaStoreRef, loadMediaObjectUrl } from "@/lib/media-cache-storage";
 import { getChatImageFromIndexedDB } from "@/lib/chat-asset-storage";
-import { ChatMessage, createOrGetSession, updateMessageMediaStatus, updateMessageMediaData, updateMessageMediaUrl } from "@/lib/chat-storage";
+import { ChatMessage, createOrGetSession, updateMessageMediaStatus, updateMessageMediaData } from "@/lib/chat-storage";
 import { resolveContactCard } from "@/lib/contact-card";
 import { loadCharacters } from "@/lib/character-storage";
 import { CHAT_OPEN_SESSION_EVENT, dispatchOpenAddContact } from "@/lib/chat-notification-events";
@@ -20,6 +20,7 @@ import remarkBreaks from "remark-breaks";
 import { createPortal } from "react-dom";
 import { Blocks, Maximize2, ReceiptText } from "lucide-react";
 import { retryChatGeneratedImage } from "@/lib/generated-image-retry";
+import { GeneratedImageErrorDialog } from "./generated-image-error-dialog";
 import { ScanPayCard } from "@/components/chat/scan-pay-card";
 import { payWithWalletBalance } from "@/lib/wallet-storage";
 import { formatShoppingPaymentRequestHistory } from "@/lib/shopping-payment-request";
@@ -1208,7 +1209,7 @@ function GeneratedImagePromptDialog({
                         placeholder="输入图片提示词"
                         disabled={busy}
                     />
-                    {error && <div className="chat-generated-image-retry-error">生成失败：{error}</div>}
+                    {error && <div className="chat-generated-image-retry-error">{error}</div>}
                 </div>
                 <div className="modal-footer" data-ui="modal-footer">
                     <button className="ui-btn ui-btn-ghost" onClick={onCancel}>取消</button>
@@ -1244,7 +1245,9 @@ function ImageBubble({
     const [showPromptEditor, setShowPromptEditor] = useState(false);
     const [promptDraft, setPromptDraft] = useState("");
     const [regenerating, setRegenerating] = useState(false);
+    // retryError 只用于提示词弹窗内的即时校验；生成失败改用一次性弹窗，不再挂红字
     const [retryError, setRetryError] = useState("");
+    const [failureNotice, setFailureNotice] = useState("");
     const isPending = d?.imageGenerationStatus === "pending";
     const canRegenerate = !isPending && Boolean(d?.label?.trim());
     const [showPreview, setShowPreview] = useState(false);
@@ -1283,7 +1286,7 @@ function ImageBubble({
                 onUpdate?.(updated);
             })
             .catch(error => {
-                setRetryError(error instanceof Error ? error.message : String(error));
+                setFailureNotice(error instanceof Error ? error.message : String(error));
             })
             .finally(() => {
                 setRegenerating(false);
@@ -1313,6 +1316,9 @@ function ImageBubble({
                     error={retryError}
                 />,
                 document.body,
+            )}
+            {failureNotice && (
+                <GeneratedImageErrorDialog message={failureNotice} onClose={() => setFailureNotice("")} />
             )}
         </>
     );
@@ -1363,7 +1369,6 @@ function ImageBubble({
                     <div className="chat-photo-card-text">{label}</div>
                 </div>
             </div>
-            {retryError && <div className="chat-generated-image-retry-error">生成失败：{retryError}</div>}
             {previewAndDialog}
         </div>
     );
@@ -1877,7 +1882,9 @@ function MediaFileBubble({
     const [showImagePromptEditor, setShowImagePromptEditor] = useState(false);
     const [imagePromptDraft, setImagePromptDraft] = useState("");
     const [imageRegenerating, setImageRegenerating] = useState(false);
+    // 同 ImageBubble：弹窗内校验用 imageRetryError，生成失败走一次性弹窗
     const [imageRetryError, setImageRetryError] = useState("");
+    const [imageFailureNotice, setImageFailureNotice] = useState("");
 
     useEffect(() => {
         if (!isMediaStoreRef(rawUrl)) {
@@ -1930,7 +1937,7 @@ function MediaFileBubble({
                 onUpdate?.(updated);
             })
             .catch(error => {
-                setImageRetryError(error instanceof Error ? error.message : String(error));
+                setImageFailureNotice(error instanceof Error ? error.message : String(error));
             })
             .finally(() => {
                 setImageRegenerating(false);
@@ -1952,6 +1959,15 @@ function MediaFileBubble({
         return (
             <div className="chat-media-file-card chat-media-file-generic">
                 <span className="chat-media-file-title" style={{ opacity: 0.5 }}>文件已过期</span>
+            </div>
+        );
+    }
+
+    // 存储空间清理会置空 mediaUrl 并打上 mediaCleanedAt：占位说明而不是一张点不动的文件卡。
+    if (!rawUrl && msg.mediaData?.mediaCleanedAt) {
+        return (
+            <div className="chat-media-file-card chat-media-file-generic">
+                <span className="chat-media-file-title" style={{ opacity: 0.5 }}>{title ? `${title} · 已清理` : "文件已清理"}</span>
             </div>
         );
     }
@@ -2019,18 +2035,29 @@ function MediaFileBubble({
 
     if (fileType === "image" && url) {
         const displayTitle = msg.mediaData?.imageGenerationPrompt ? "" : title;
-        const canRegenerateImage = Boolean(msg.mediaData?.label?.trim())
+        // 重试把状态落库为 pending（见 generated-image-retry.ts），角标据此显示——
+        // 比组件内的 imageRegenerating 可靠：滚远了卸载再回来，角标还在。
+        const imageRegenPending = msg.mediaData?.imageGenerationStatus === "pending";
+        const canRegenerateImage = !imageRegenPending
+            && Boolean(msg.mediaData?.label?.trim())
             && (msg.mediaData?.imageGenerationStatus === "generated" || Boolean(msg.mediaData?.imageGenerationPrompt));
         return (
             <div className="chat-generated-image-retry-stack">
-                <MediaImageWithPreview
-                    url={url}
-                    title={displayTitle}
-                    filename={title}
-                    onRegenerate={canRegenerateImage ? openImagePromptEditor : undefined}
-                    regenerating={imageRegenerating}
-                />
-                {imageRetryError && <div className="chat-generated-image-retry-error">生成失败：{imageRetryError}</div>}
+                <div className="chat-generated-image-regen-wrap">
+                    <MediaImageWithPreview
+                        url={url}
+                        title={displayTitle}
+                        filename={title}
+                        onRegenerate={canRegenerateImage ? openImagePromptEditor : undefined}
+                        regenerating={imageRegenerating}
+                    />
+                    {imageRegenPending && (
+                        <div className="chat-generated-image-regen-badge" aria-hidden="true">
+                            <span className="chat-generated-image-regen-spinner" />
+                            生成中
+                        </div>
+                    )}
+                </div>
                 {showImagePromptEditor && typeof document !== "undefined" && createPortal(
                     <GeneratedImagePromptDialog
                         value={imagePromptDraft}
@@ -2041,6 +2068,12 @@ function MediaFileBubble({
                         error={imageRetryError}
                     />,
                     document.body,
+                )}
+                {imageFailureNotice && (
+                    <GeneratedImageErrorDialog
+                        message={imageFailureNotice}
+                        onClose={() => setImageFailureNotice("")}
+                    />
                 )}
             </div>
         );
@@ -2060,7 +2093,15 @@ function MediaFileBubble({
 
     return (
         <div className="chat-media-file-wrap">
-            <div className="chat-media-file-card chat-media-file-generic" onClick={(e) => { e.stopPropagation(); if (url) window.open(url, "_blank"); }}>
+            <div className="chat-media-file-card chat-media-file-generic" onClick={(e) => {
+                e.stopPropagation();
+                if (!url) return;
+                // 与右侧保存按钮同路：iOS 走系统分享卡，其余平台常规下载（window.open 在 iOS 上会跳浏览器）
+                void (async () => {
+                    const { downloadUrl } = await import("@/lib/download-utils");
+                    await downloadUrl(url, ensureExtension(title, "file"));
+                })();
+            }}>
                 <svg width="20" height="20" viewBox="0 0 24 24" fill="none" stroke="currentColor" strokeWidth="1.5">
                     <path d="M14 2H6a2 2 0 00-2 2v16a2 2 0 002 2h12a2 2 0 002-2V8z" /><path d="M14 2v6h6" /><line x1="16" y1="13" x2="8" y2="13" /><line x1="16" y1="17" x2="8" y2="17" />
                 </svg>
@@ -2156,10 +2197,44 @@ function XiaohongshuShareBubble({ msg }: { msg: ChatMessage }) {
 }
 
 // ── Voice Message ───────────────────────────────
+
+// 模块级在途表：同一条消息全局只允许一个合成请求。组件重渲染/卸载重挂都
+// 复用同一个 Promise——之前"挂载即合成 + 取消竞态"会把同一条语音反复送去
+// 计费还留下点不动的死气泡（用户实报），点击触发 + 全局去重从根上断掉。
+const _voiceSynthInFlight = new Map<string, Promise<string>>();
+
+function synthesizeVoiceForMessage(msgId: string, characterId: string, speechText: string): Promise<string> {
+    const existing = _voiceSynthInFlight.get(msgId);
+    if (existing) return existing;
+    const task = (async () => {
+        const { resolveVoiceConfig, synthesizeSpeech } = await import("@/lib/tts-service");
+        const vc = resolveVoiceConfig(characterId);
+        if (!vc) throw new Error("未绑定语音配置");
+        const blob = await synthesizeSpeech(speechText, vc);
+        if (!blob) throw new Error("合成失败");
+        const dataUrl = await new Promise<string>((resolve, reject) => {
+            const reader = new FileReader();
+            reader.onload = () => resolve(reader.result as string);
+            reader.onerror = () => reject(new Error("音频编码失败"));
+            reader.readAsDataURL(blob);
+        });
+        // 直接落库（不依赖会话缓存）——合成一次的音频永久保存，绝不重复计费
+        const { persistMessageVoiceAudio } = await import("@/lib/chat-storage");
+        await persistMessageVoiceAudio(msgId, dataUrl, speechText);
+        return dataUrl;
+    })();
+    _voiceSynthInFlight.set(msgId, task);
+    task.catch(() => {}).then(() => { _voiceSynthInFlight.delete(msgId); });
+    return task;
+}
+
 function VoiceMessageBubble({ msg, characterId, onUpdate, defaultTranslationExpanded = false }: { msg: ChatMessage; characterId?: string; onUpdate?: (m: ChatMessage) => void; defaultTranslationExpanded?: boolean }) {
     const [playing, setPlaying] = useState(false);
     const [synthesizing, setSynthesizing] = useState(false);
+    const [synthFailed, setSynthFailed] = useState(false);
     const audioRef = useRef<HTMLAudioElement | null>(null);
+    const mountedRef = useRef(true);
+    useEffect(() => { mountedRef.current = true; return () => { mountedRef.current = false; }; }, []);
     const text = msg.mediaData?.label || "语音消息";
     const bilingual = splitBilingualText(text);
     const speechText = bilingual?.original || text;
@@ -2167,48 +2242,7 @@ function VoiceMessageBubble({ msg, characterId, onUpdate, defaultTranslationExpa
     const needsResynthesis = msg.role !== "user" && synthesizedFromText !== speechText;
     const duration = msg.mediaData?.voiceDuration || Math.max(2, Math.ceil(speechText.length / 4));
 
-    // Auto-synthesize on mount if no audio yet (AI messages)
-    useEffect(() => {
-        if ((msg.mediaUrl && !needsResynthesis) || msg.role === "user" || synthesizing) return;
-        if (!characterId) return;
-        let cancelled = false;
-        setSynthesizing(true);
-        (async () => {
-            try {
-                const { resolveVoiceConfig, synthesizeSpeech } = await import("@/lib/tts-service");
-                const vc = resolveVoiceConfig(characterId);
-                if (!vc || cancelled) { setSynthesizing(false); return; }
-                const blob = await synthesizeSpeech(speechText, vc);
-                if (cancelled || !blob) { setSynthesizing(false); return; }
-                // Convert to base64 data URL and persist
-                const reader = new FileReader();
-                reader.onload = () => {
-                    if (cancelled) return;
-                    const dataUrl = reader.result as string;
-                    const nextMediaData = { ...msg.mediaData, synthesizedFromText: speechText };
-                    updateMessageMediaData(msg.id, nextMediaData);
-                    updateMessageMediaUrl(msg.id, dataUrl);
-                    if (onUpdate) onUpdate({ ...msg, mediaUrl: dataUrl, mediaData: nextMediaData });
-                    setSynthesizing(false);
-                };
-                reader.readAsDataURL(blob);
-            } catch { if (!cancelled) setSynthesizing(false); }
-        })();
-        return () => { cancelled = true; };
-    // eslint-disable-next-line react-hooks/exhaustive-deps
-    }, [msg.id, msg.mediaUrl, msg.mediaData, characterId, needsResynthesis, speechText]);
-
-    const handlePlay = () => {
-        if (synthesizing || needsResynthesis) return;
-        if (playing && audioRef.current) {
-            const active = audioRef.current;
-            audioRef.current = null;
-            try { active.pause(); active.removeAttribute("src"); active.load(); } catch { /* ignore */ }
-            setPlaying(false);
-            return;
-        }
-        const src = msg.mediaUrl;
-        if (!src) return;
+    const playSrc = (src: string) => {
         // 必须用 <audio> 元素:iOS 静音拨键会掐掉 Web Audio 的输出(表现为全线
         // 无声),媒体元素不受影响。元素属于宿主页面,锁屏媒体卡片指向站点本身,
         // 点了只会回到 App;播完清 src 让卡片立即撤下。
@@ -2223,6 +2257,41 @@ function VoiceMessageBubble({ msg, characterId, onUpdate, defaultTranslationExpa
         audio.onended = finalize;
         audio.onerror = finalize;
         audio.play().catch(finalize);
+    };
+
+    // 点击才合成（不再挂载即合成）：已有音频直接播；没有就现场合成一次，
+    // 合成结果已在任务内落库，之后任何时候点都是直接播放，不再消耗额度。
+    const handlePlay = () => {
+        if (synthesizing) return;
+        if (playing && audioRef.current) {
+            const active = audioRef.current;
+            audioRef.current = null;
+            try { active.pause(); active.removeAttribute("src"); active.load(); } catch { /* ignore */ }
+            setPlaying(false);
+            return;
+        }
+        if (msg.mediaUrl && !needsResynthesis) {
+            playSrc(msg.mediaUrl);
+            return;
+        }
+        if (msg.role === "user" || !characterId) {
+            if (msg.mediaUrl) playSrc(msg.mediaUrl);
+            return;
+        }
+        setSynthesizing(true);
+        setSynthFailed(false);
+        synthesizeVoiceForMessage(msg.id, characterId, speechText)
+            .then((dataUrl) => {
+                if (onUpdate) onUpdate({ ...msg, mediaUrl: dataUrl, mediaData: { ...msg.mediaData, synthesizedFromText: speechText } });
+                if (!mountedRef.current) return;
+                setSynthesizing(false);
+                playSrc(dataUrl);
+            })
+            .catch(() => {
+                if (!mountedRef.current) return;
+                setSynthesizing(false);
+                setSynthFailed(true);
+            });
     };
 
     useEffect(() => () => { audioRef.current?.pause(); }, []);
@@ -2259,7 +2328,7 @@ function VoiceMessageBubble({ msg, characterId, onUpdate, defaultTranslationExpa
                     />
                 ))}
             </div>
-            <span className="voice-msg-dur">{duration}&quot;</span>
+            <span className="voice-msg-dur">{synthFailed ? "合成失败·点击重试" : `${duration}"`}</span>
         </div>
     );
 }

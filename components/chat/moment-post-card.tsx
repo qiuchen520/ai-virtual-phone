@@ -19,6 +19,7 @@ import { buildTwoLevelMomentThreads } from "@/lib/moments-comment-threading";
 import { getChatImageFromIndexedDB } from "@/lib/chat-asset-storage";
 import { splitBilingualText } from "@/lib/bilingual-text";
 import { retryMomentGeneratedPhoto } from "@/lib/generated-image-retry";
+import { GeneratedImageErrorDialog } from "./generated-image-error-dialog";
 import { Trash2, MoreHorizontal, MapPin, Heart, MessageCircle, Pencil } from "lucide-react";
 import { ConfirmDialog } from "@/components/ui";
 
@@ -42,7 +43,9 @@ export function MomentPostCard({ post, onUpdate, onRequestDelete, onOpenCommentC
     const [photoPromptDraft, setPhotoPromptDraft] = useState("");
     const [photoRegenerating, setPhotoRegenerating] = useState(false);
     const [showFallbackPreview, setShowFallbackPreview] = useState(false);
+    // photoRetryError 只用于提示词弹窗内的即时校验；生成失败改用一次性弹窗，不再挂红字
     const [photoRetryError, setPhotoRetryError] = useState("");
+    const [photoFailureNotice, setPhotoFailureNotice] = useState("");
     const [showPostActions, setShowPostActions] = useState(false);
     const postActionsRef = useRef<HTMLDivElement>(null);
     const postActionsBtnRef = useRef<HTMLButtonElement>(null);
@@ -240,6 +243,7 @@ export function MomentPostCard({ post, onUpdate, onRequestDelete, onOpenCommentC
     const canRegeneratePhoto = Boolean(resolvedPhotoUrl)
         && Boolean(post.photoUrl)
         && Boolean(post.photoDescription?.trim())
+        && post.photoGenerationStatus !== "pending"
         && (post.photoGenerationStatus === "generated" || Boolean(post.photoGenerationPrompt));
     const openPhotoPromptEditor = useCallback(() => {
         setPhotoPromptDraft(post.photoDescription?.trim() || "");
@@ -258,7 +262,7 @@ export function MomentPostCard({ post, onUpdate, onRequestDelete, onOpenCommentC
         retryMomentGeneratedPhoto(post, nextDescription)
             .then(() => onUpdate())
             .catch(error => {
-                setPhotoRetryError(error instanceof Error ? error.message : String(error));
+                setPhotoFailureNotice(error instanceof Error ? error.message : String(error));
             })
             .finally(() => {
                 setPhotoRegenerating(false);
@@ -334,8 +338,11 @@ export function MomentPostCard({ post, onUpdate, onRequestDelete, onOpenCommentC
                 </div>
             )}
 
-            {/* Photo area */}
-            <div className="feed-post-media mb-5 w-full flex flex-col gap-2">
+            {/* Photo area —— 四块内容全无时整个容器不渲染：空壳会照样吃掉自己的下边距
+                （flex 容器不会自塌陷），无配图的帖子正文和时间行之间就凭空多出一截，看着像空了一行。
+                间距用 mb-3 与卡片其余部分（头像行/正文/位置）对齐，media 原本的 mb-5 是全卡唯一的孤例。 */}
+            {(resolvedPhotoUrl || fallbackPhotoDescription) && (
+            <div className="feed-post-media mb-3 w-full flex flex-col gap-2">
                 {resolvedPhotoUrl && (
                     <MediaImageWithPreview
                         url={resolvedPhotoUrl}
@@ -348,11 +355,14 @@ export function MomentPostCard({ post, onUpdate, onRequestDelete, onOpenCommentC
                         regenerating={photoRegenerating}
                     />
                 )}
+                {resolvedPhotoUrl && post.photoGenerationStatus === "pending" && (
+                    <div className="ts-12 text-[var(--c-icon)] opacity-80">图片重新生成中…</div>
+                )}
                 {fallbackPhotoDescription && (
                     <div className="feed-post-photo-retry-stack">
                         <div className="feed-post-photo-retry-row">
                             <div
-                                className="feed-post-photo-description ts-13 italic leading-[1.8] opacity-80 text-[var(--c-text)] px-4 py-3 inline-block max-w-full"
+                                className="feed-post-photo-description ts-13 italic leading-[1.8] opacity-80 text-[var(--c-text)] px-4 py-3 block w-full"
                                 style={{ background: "color-mix(in srgb, var(--c-text) 10%, transparent)", borderRadius: 0, cursor: canRetryPhoto ? "pointer" : undefined }}
                                 onClick={canRetryPhoto ? (e => { e.stopPropagation(); setShowFallbackPreview(true); }) : undefined}
                             >
@@ -362,13 +372,10 @@ export function MomentPostCard({ post, onUpdate, onRequestDelete, onOpenCommentC
                         {post.photoGenerationStatus === "pending" && (
                             <div className="ts-12 text-[var(--c-icon)] opacity-80">图片生成中…</div>
                         )}
-                        {post.photoGenerationStatus === "failed" && post.photoGenerationError && !photoRetryError && (
-                            <div className="feed-post-photo-retry-error">生成失败：{post.photoGenerationError}</div>
-                        )}
                     </div>
                 )}
-                {photoRetryError && <div className="feed-post-photo-retry-error">生成失败：{photoRetryError}</div>}
             </div>
+            )}
             {showFallbackPreview && fallbackPhotoDescription && (
                 <MediaPreviewOverlay
                     description={fallbackPhotoDescription}
@@ -391,7 +398,7 @@ export function MomentPostCard({ post, onUpdate, onRequestDelete, onOpenCommentC
                                 placeholder="输入图片提示词"
                                 disabled={photoRegenerating}
                             />
-                            {photoRetryError && <div className="feed-post-photo-retry-error">生成失败：{photoRetryError}</div>}
+                            {photoRetryError && <div className="feed-post-photo-retry-error">{photoRetryError}</div>}
                         </div>
                         <div className="modal-footer" data-ui="modal-footer">
                             <button className="ui-btn ui-btn-ghost" onClick={() => setShowPhotoPromptEditor(false)}>取消</button>
@@ -406,6 +413,13 @@ export function MomentPostCard({ post, onUpdate, onRequestDelete, onOpenCommentC
                     </div>
                 </div>,
                 document.body,
+            )}
+
+            {photoFailureNotice && (
+                <GeneratedImageErrorDialog
+                    message={photoFailureNotice}
+                    onClose={() => setPhotoFailureNotice("")}
+                />
             )}
 
             {editingPostOpen && typeof document !== "undefined" && createPortal(
