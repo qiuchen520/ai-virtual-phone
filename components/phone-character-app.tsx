@@ -53,6 +53,7 @@ import {
 import { notifyMascotPageContext } from "@/lib/mascot-events";
 import { kvGet, kvSet } from "@/lib/kv-db";
 import { normalizeTimeZone } from "@/lib/character-time";
+import { removeCharacterChatReferences } from "@/lib/character-chat-cleanup";
 
 type ViewType = "list" | "detail";
 
@@ -62,6 +63,51 @@ type CanvasRelationLine = { key: string; aId: string; bId: string; labels: strin
 // 每个世界一张画布：平移缩放记忆按世界分 key（默认世界沿用旧 key，存量零迁移）
 const PAN_STORAGE_BASE_KEY = 'ai_phone_canvas_pan_v2';
 const WORLD_TAB_KEY = 'ai_phone_character_app_world_v1';
+const CHARACTER_AVATAR_MAX_BYTES = 600 * 1024;
+const CHARACTER_AVATAR_COMPRESSION_FALLBACKS = [
+  { maxSize: 1280, quality: 0.8 },
+  { maxSize: 1024, quality: 0.8 },
+  { maxSize: 1024, quality: 0.72 },
+  { maxSize: 768, quality: 0.72 },
+  { maxSize: 640, quality: 0.68 },
+  { maxSize: 512, quality: 0.64 },
+  { maxSize: 400, quality: 0.6 },
+  { maxSize: 320, quality: 0.56 },
+] as const;
+
+const POLAROID_RATIOS = [
+  { label: "1:1", className: "ratio-square" },
+  { label: "3:4", className: "ratio-portrait" },
+  { label: "4:3", className: "ratio-landscape" },
+  { label: "16:9", className: "ratio-16-9" },
+  { label: "9:16", className: "ratio-9-16" },
+] as const;
+
+const POLAROID_SIZE_WIDTHS = { small: 110, medium: 130, large: 150 } as const;
+
+function clampCharacterImageValue(value: number, min: number, max: number, fallback: number): number {
+  return Number.isFinite(value) ? Math.min(max, Math.max(min, value)) : fallback;
+}
+
+function getCharacterImagePositionLimit(
+  zoom: number,
+  naturalWidth: number,
+  naturalHeight: number,
+  previewWidth: number,
+  previewHeight: number,
+): { x: number; y: number } {
+  if (!naturalWidth || !naturalHeight || !previewWidth || !previewHeight) {
+    return { x: 0, y: 0 };
+  }
+  const coverScale = Math.max(previewWidth / naturalWidth, previewHeight / naturalHeight) * zoom;
+  const renderedWidth = naturalWidth * coverScale;
+  const renderedHeight = naturalHeight * coverScale;
+  return {
+    x: Math.max(0, ((renderedWidth - previewWidth) / 2 / previewWidth) * 100),
+    y: Math.max(0, ((renderedHeight - previewHeight) / 2 / previewHeight) * 100),
+  };
+}
+
 function worldPanKey(worldId: string): string {
   return worldId === DEFAULT_CHARACTER_WORLD_ID ? PAN_STORAGE_BASE_KEY : `${PAN_STORAGE_BASE_KEY}_${worldId}`;
 }
@@ -298,10 +344,12 @@ export function PhoneCharacterApp({ onClose, onNotice }: PhoneCharacterAppProps)
               setView({ type: "detail", id: existing.id, isEditing: false });
               onNotice(`已切换到 V${activeVersion}，未创建新版本`);
             }}
-            onDelete={() => {
-              if (view.id) {
-                clearCharacterVersions(view.id);
-                updateChars(characters.filter((c) => c.id !== view.id));
+            onDelete={async () => {
+              const characterId = view.id;
+              if (characterId) {
+                await removeCharacterChatReferences(characterId);
+                clearCharacterVersions(characterId);
+                updateChars(characters.filter((c) => c.id !== characterId));
               }
               setView({ type: "list", id: null, isEditing: false });
               onNotice("已删除档案");
@@ -317,6 +365,7 @@ export function PhoneCharacterApp({ onClose, onNotice }: PhoneCharacterAppProps)
                 onNotice("导出成功");
               }
             }}
+            onNotice={onNotice}
           />
         )}
       </div>
@@ -663,6 +712,7 @@ function CharListView({
   }
   const [deleteConfirm, setDeleteConfirm] = useState<{ id: string, type: 'char' | 'bg' } | null>(null);
   const [deleteConfirmReady, setDeleteConfirmReady] = useState(false);
+  const [deleteBusy, setDeleteBusy] = useState(false);
   const [isAnyDragging, setIsAnyDragging] = useState(false);
   const [overTrashBin, setOverTrashBin] = useState(false);
   // 拖拽结束（含取消）时清掉世界 tab 的归档高亮
@@ -682,6 +732,7 @@ function CharListView({
   useEffect(() => {
     if (!deleteConfirm) {
       setDeleteConfirmReady(false);
+      setDeleteBusy(false);
       return;
     }
     setDeleteConfirmReady(false);
@@ -1142,10 +1193,11 @@ function CharListView({
               const hash = char.id.charCodeAt(0) + idx * 17;
               const styleIdx = char.polaroidStyle ?? (hash % 5);
 
-              const sizeMod = (hash % 5);
-              const w = 110 + sizeMod * 10;
-              const ratioClassArray = ["ratio-square", "ratio-portrait", "ratio-landscape", "ratio-16-9", "ratio-9-16"];
-              const ratioClass = ratioClassArray[styleIdx % ratioClassArray.length];
+              const sizeMode = char.polaroidSize ?? "random";
+              const w = sizeMode === "random"
+                ? 110 + (hash % 5) * 10
+                : POLAROID_SIZE_WIDTHS[sizeMode];
+              const ratioClass = POLAROID_RATIOS[styleIdx % POLAROID_RATIOS.length].className;
 
               const tapeStyles = ["char-polaroid-tape-white", "char-polaroid-tape-red", "char-polaroid-tape-black"];
               const tapeMod = char.polaroidStyle !== undefined ? styleIdx % tapeStyles.length : hash % 3;
@@ -1165,6 +1217,7 @@ function CharListView({
                   onEditTap={handleCharEditTap}
                   onDragMoveAt={handleCharDragMoveAt}
                   onDropAt={handleCharDropAt}
+                  use2dTransform
                   trashBinRef={trashBinRef}
                   onDragActiveChange={setIsAnyDragging}
                   onOverTrashChange={setOverTrashBin}
@@ -1178,7 +1231,16 @@ function CharListView({
                     </div>
                   )}
                   <div className="char-polaroid-img-wrapper" style={{ boxShadow: "inset 0 0 10px rgba(0,0,0,0.1)" }}>
-                    {char.avatar ? <img src={char.avatar} alt={char.name} className="char-polaroid-img" draggable={false} /> : <CharAvatarFallback name={char.name} size="100%" />}
+                    {char.avatar ? <img
+                      src={char.avatar}
+                      alt={char.name}
+                      className="char-polaroid-img"
+                      draggable={false}
+                      style={{
+                        objectPosition: `${100 - (char.polaroidImageX ?? 50)}% ${100 - (char.polaroidImageY ?? 50)}%`,
+                        transform: `scale(${char.polaroidImageZoom ?? 1})`,
+                      }}
+                    /> : <CharAvatarFallback name={char.name} size="100%" />}
                     <button
                       className="char-polaroid-menu-btn absolute top-1 right-1 w-6 h-6 bg-black/20 text-white rounded-full flex items-center justify-center cursor-pointer hover:bg-black/40 transition-colors z-10"
                       onClick={(e) => { e.stopPropagation(); setActiveMoveChar(char); }}
@@ -1306,31 +1368,43 @@ function CharListView({
           className="modal-overlay"
           style={{ zIndex: 8000000, backdropFilter: "blur(var(--ui-blur-light))" }}
           onClick={() => {
-            if (deleteConfirmReady) setDeleteConfirm(null);
+            if (deleteConfirmReady && !deleteBusy) setDeleteConfirm(null);
           }}
         >
           <div className="char-punched-hole-note" onClick={(e) => e.stopPropagation()}>
             <h3>销毁确认</h3>
-            <p>您确定要丢弃该档案或物件吗？此操作将永远无法恢复。</p>
+            <p>{deleteConfirm.type === "char"
+              ? "角色档案、联系人及与该角色的单聊记录将一并删除；角色会从群聊成员中移除，但群聊和群聊历史会保留。此操作无法恢复。"
+              : "您确定要丢弃该物件吗？此操作将永远无法恢复。"}</p>
             <div className="char-punched-hole-btn-group">
               <button
                 className="char-punched-hole-btn"
-                disabled={!deleteConfirmReady}
+                disabled={!deleteConfirmReady || deleteBusy}
                 onClick={() => {
-                  if (deleteConfirmReady) setDeleteConfirm(null);
+                  if (deleteConfirmReady && !deleteBusy) setDeleteConfirm(null);
                 }}
               >驳回申请</button>
-              <button className="char-punched-hole-btn danger" disabled={!deleteConfirmReady} onClick={() => {
-                if (!deleteConfirmReady) return;
-                if (deleteConfirm.type === 'char') {
-                  onUpdateChars(characters.filter(c => c.id !== deleteConfirm.id));
-                  onNotice?.("已销毁调查档案");
-                } else {
-                  onUpdateBgItems((bgItems || []).filter(b => b.id !== deleteConfirm.id));
-                  onNotice?.("已销毁散落物件");
+              <button className="char-punched-hole-btn danger" disabled={!deleteConfirmReady || deleteBusy} onClick={async () => {
+                if (!deleteConfirmReady || deleteBusy) return;
+                const target = deleteConfirm;
+                setDeleteBusy(true);
+                try {
+                  if (target.type === 'char') {
+                    await removeCharacterChatReferences(target.id);
+                    clearCharacterVersions(target.id);
+                    onUpdateChars(characters.filter(c => c.id !== target.id));
+                    onNotice?.("已销毁调查档案");
+                  } else {
+                    onUpdateBgItems((bgItems || []).filter(b => b.id !== target.id));
+                    onNotice?.("已销毁散落物件");
+                  }
+                  setDeleteConfirm(null);
+                } catch (error) {
+                  console.error("[Character] delete failed:", error);
+                  setDeleteBusy(false);
+                  onNotice?.("删除失败，请重试");
                 }
-                setDeleteConfirm(null);
-              }}>批准销毁</button>
+              }}>{deleteBusy ? "销毁中…" : "批准销毁"}</button>
             </div>
           </div>
         </div>
@@ -1600,7 +1674,7 @@ function CharListView({
 function DraggableNode({
   id, x, y, rot, zIndex, children, onDragEnd, onClick, className, w, isEditing, onDeleteIntent,
   trashBinRef, onDragActiveChange, onOverTrashChange, zoom = 1, pinchRef,
-  onEditTap, onDragMoveAt, onDropAt
+  onEditTap, onDragMoveAt, onDropAt, use2dTransform = false
 }: {
   id: string; x: number; y: number; rot: number; zIndex: number;
   children: React.ReactNode;
@@ -1619,12 +1693,17 @@ function DraggableNode({
   onDragMoveAt?: (clientX: number, clientY: number) => void;
   /** 松手时的落点处理；返回 true 表示已被消费（如归档进其他世界），位置回弹 */
   onDropAt?: (id: string, clientX: number, clientY: number) => boolean;
+  /** 使用二维位移，避免 3D 合成导致档案墙图片重采样模糊 */
+  use2dTransform?: boolean;
 }) {
   const [pos, setPos] = useState({ x, y });
   const [isDragging, setIsDragging] = useState(false);
   const dragStart = useRef({ cx: 0, cy: 0, startX: 0, startY: 0, moved: false });
 
   useEffect(() => { setPos({ x, y }); }, [x, y]);
+  useEffect(() => {
+    dragStart.current.moved = false;
+  }, [isEditing]);
 
   function handlePointerDown(e: React.PointerEvent) {
     if (pinchRef?.current) return;
@@ -1740,7 +1819,9 @@ function DraggableNode({
       onClickCapture={handleClick}
       style={{
         width: w,
-        transform: `translate3d(${pos.x}px, ${pos.y}px, 0) rotate(${rot}deg)`,
+        transform: use2dTransform
+          ? `translate(${pos.x}px, ${pos.y}px) rotate(${rot}deg)`
+          : `translate3d(${pos.x}px, ${pos.y}px, 0) rotate(${rot}deg)`,
         zIndex: isDragging ? 9999999 : zIndex,
         cursor: isDragging ? 'grabbing' : 'grab',
         touchAction: 'none',
@@ -1767,6 +1848,7 @@ function CharArchiveView({
   onDelete,
   onExportJson,
   onExportPng,
+  onNotice = () => { },
   dummy,
 }: {
   char: Character;
@@ -1777,12 +1859,14 @@ function CharArchiveView({
   onCancelEdit?: () => void;
   onSave?: (data: CharacterImportData, createVersion: boolean) => void;
   onRestoreVersion?: (version: CharacterVersion) => void;
-  onDelete: () => void;
+  onDelete: () => void | Promise<void>;
   onExportJson: () => void;
   onExportPng: () => Promise<void>;
+  onNotice?: (text: string) => void;
   dummy?: boolean;
 }) {
   const [confirmDelete, setConfirmDelete] = useState(false);
+  const [deleteBusy, setDeleteBusy] = useState(false);
   const [showUnsavedConfirm, setShowUnsavedConfirm] = useState<"back" | "cancel" | null>(null);
   const [showSaveVersionConfirm, setShowSaveVersionConfirm] = useState(false);
   const [showVersions, setShowVersions] = useState(false);
@@ -1801,9 +1885,45 @@ function CharArchiveView({
   const [showTimeZonePicker, setShowTimeZonePicker] = useState(false);
   const [timeZoneSearch, setTimeZoneSearch] = useState(char.timeZone || "");
   const [avatar, setAvatar] = useState<string | null>(char.avatar || null);
+  const [polaroidStyle, setPolaroidStyle] = useState(char.polaroidStyle ?? 0);
+  const [polaroidSize, setPolaroidSize] = useState<Character["polaroidSize"]>(char.polaroidSize ?? "random");
+  const [polaroidImageX, setPolaroidImageX] = useState(char.polaroidImageX ?? 50);
+  const [polaroidImageY, setPolaroidImageY] = useState(char.polaroidImageY ?? 50);
+  const [polaroidImageZoom, setPolaroidImageZoom] = useState(char.polaroidImageZoom ?? 1);
+  const previewPointers = useRef(new Map<number, { x: number; y: number }>());
+  const previewGesture = useRef<{ distance: number; zoom: number } | null>(null);
+  const previewImageState = useRef({ x: polaroidImageX, y: polaroidImageY, zoom: polaroidImageZoom });
+  const previewRef = useRef<HTMLDivElement>(null);
+  const previewImageRef = useRef<HTMLImageElement>(null);
+  const [previewImageNaturalSize, setPreviewImageNaturalSize] = useState({ width: 0, height: 0 });
   const [showUrlInput, setShowUrlInput] = useState(false);
   const [urlInput, setUrlInput] = useState("");
+  const [avatarBusy, setAvatarBusy] = useState(false);
   const fileRef = useRef<HTMLInputElement>(null);
+
+  // Ctrl+滚轮缩放：React 把 wheel 注册成被动监听，onWheel 里 preventDefault 不生效，
+  // 页面会跟着一起缩放。这里挂原生非被动监听。
+  useEffect(() => {
+    const element = previewRef.current;
+    if (!element) return;
+    const onWheel = (e: WheelEvent) => {
+      if (!e.ctrlKey) return;
+      e.preventDefault();
+      const zoom = clampCharacterImageValue(previewImageState.current.zoom - e.deltaY * 0.005, 1, 3, 1);
+      previewImageState.current.zoom = zoom;
+      setPolaroidImageZoom(zoom);
+    };
+    element.addEventListener("wheel", onWheel, { passive: false });
+    return () => element.removeEventListener("wheel", onWheel);
+  }, [isEditing]);
+
+  useLayoutEffect(() => {
+    setPreviewImageNaturalSize({ width: 0, height: 0 });
+    const image = previewImageRef.current;
+    if (avatar && image?.complete && image.naturalWidth > 0 && image.naturalHeight > 0) {
+      setPreviewImageNaturalSize({ width: image.naturalWidth, height: image.naturalHeight });
+    }
+  }, [isEditing, avatar, polaroidStyle]);
 
   // Send mascot page context (on mount + field changes)
   useEffect(() => {
@@ -1853,6 +1973,11 @@ function CharArchiveView({
     if (briefPersona !== (char.briefPersona || "")) return true;
     if (timeZone !== (char.timeZone || "")) return true;
     if (avatar !== (char.avatar || null)) return true;
+    if (polaroidStyle !== (char.polaroidStyle ?? 0)) return true;
+    if (polaroidSize !== (char.polaroidSize ?? "random")) return true;
+    if (polaroidImageX !== (char.polaroidImageX ?? 50)) return true;
+    if (polaroidImageY !== (char.polaroidImageY ?? 50)) return true;
+    if (polaroidImageZoom !== (char.polaroidImageZoom ?? 1)) return true;
     const origTags = char.tags || [];
     if (tags.length !== origTags.length || tags.some((t, i) => t !== origTags[i])) return true;
     return false;
@@ -1878,12 +2003,35 @@ function CharArchiveView({
       setShowTimeZonePicker(false);
       setTags(char.tags || []);
       setAvatar(char.avatar || null);
+      setPolaroidStyle(char.polaroidStyle ?? 0);
+      setPolaroidSize(char.polaroidSize ?? "random");
+      setPolaroidImageX(char.polaroidImageX ?? 50);
+      setPolaroidImageY(char.polaroidImageY ?? 50);
+      setPolaroidImageZoom(char.polaroidImageZoom ?? 1);
+      previewImageState.current = {
+        x: char.polaroidImageX ?? 50,
+        y: char.polaroidImageY ?? 50,
+        zoom: char.polaroidImageZoom ?? 1,
+      };
     }
   }, [isEditing, char]);
 
   async function handleAvatarFile(file: File) {
-    const url = await fileToDataUrl(file);
-    setAvatar(url);
+    setAvatarBusy(true);
+    try {
+      const url = await fileToDataUrl(file, {
+        maxSize: 1280,
+        quality: 0.86,
+        maxBytes: CHARACTER_AVATAR_MAX_BYTES,
+        fallbacks: CHARACTER_AVATAR_COMPRESSION_FALLBACKS,
+      });
+      setAvatar(url);
+    } catch (error) {
+      console.error("Failed to optimize character avatar", error);
+      onNotice(error instanceof Error ? error.message : "图片处理失败，请更换图片");
+    } finally {
+      setAvatarBusy(false);
+    }
   }
 
   function handleAvatarUrl() {
@@ -1919,7 +2067,12 @@ function CharArchiveView({
           : undefined,
         timeZone: normalizedTimeZone,
         tags,
-        avatar: avatar ?? null
+        avatar: avatar ?? null,
+        polaroidStyle,
+        polaroidSize,
+        polaroidImageX: clampCharacterImageValue(polaroidImageX, 0, 100, 50),
+        polaroidImageY: clampCharacterImageValue(polaroidImageY, 0, 100, 50),
+        polaroidImageZoom: clampCharacterImageValue(polaroidImageZoom, 1, 3, 1),
       }, createVersion);
     }
   }
@@ -1998,6 +2151,65 @@ function CharArchiveView({
     setShowTimeZonePicker(false);
   }
 
+  function handlePreviewPointerDown(e: React.PointerEvent<HTMLDivElement>) {
+    e.preventDefault();
+    e.currentTarget.setPointerCapture(e.pointerId);
+    previewPointers.current.set(e.pointerId, { x: e.clientX, y: e.clientY });
+    if (previewPointers.current.size === 2) {
+      const [first, second] = Array.from(previewPointers.current.values());
+      previewGesture.current = {
+        distance: Math.hypot(second.x - first.x, second.y - first.y),
+        zoom: previewImageState.current.zoom,
+      };
+    }
+  }
+
+  function handlePreviewPointerMove(e: React.PointerEvent<HTMLDivElement>) {
+    if (!previewPointers.current.has(e.pointerId)) return;
+    e.preventDefault();
+    const previous = previewPointers.current.get(e.pointerId);
+    previewPointers.current.set(e.pointerId, { x: e.clientX, y: e.clientY });
+    const points = Array.from(previewPointers.current.values());
+    if (points.length >= 2 && previewGesture.current) {
+      const distance = Math.hypot(points[1].x - points[0].x, points[1].y - points[0].y);
+      if (previewGesture.current.distance > 0) {
+        const zoom = clampCharacterImageValue(
+          previewGesture.current.zoom * distance / previewGesture.current.distance,
+          1,
+          3,
+          1,
+        );
+        previewImageState.current.zoom = zoom;
+        setPolaroidImageZoom(zoom);
+      }
+      return;
+    }
+    if (points.length === 1 && previous) {
+      const rect = e.currentTarget.getBoundingClientRect();
+      const dx = e.clientX - previous.x;
+      const dy = e.clientY - previous.y;
+      const previewRect = previewRef.current?.getBoundingClientRect();
+      const limit = getCharacterImagePositionLimit(
+        previewImageState.current.zoom,
+        previewImageNaturalSize.width,
+        previewImageNaturalSize.height,
+        previewRect?.width || 0,
+        previewRect?.height || 0,
+      );
+      const x = clampCharacterImageValue(previewImageState.current.x + (dx / rect.width) * 100, 50 - limit.x, 50 + limit.x, 50);
+      const y = clampCharacterImageValue(previewImageState.current.y + (dy / rect.height) * 100, 50 - limit.y, 50 + limit.y, 50);
+      previewImageState.current.x = x;
+      previewImageState.current.y = y;
+      setPolaroidImageX(x);
+      setPolaroidImageY(y);
+    }
+  }
+
+  function handlePreviewPointerUp(e: React.PointerEvent<HTMLDivElement>) {
+    previewPointers.current.delete(e.pointerId);
+    previewGesture.current = null;
+  }
+
   const archiveFrame = (
       <div className="char-archive-frame">
         <div className="char-archive-stamp">CLASSIFIED</div>
@@ -2014,9 +2226,9 @@ function CharArchiveView({
           <div className="char-archive-left">
             <div
               className="char-archive-photo relative"
-              style={{ cursor: isEditing ? "pointer" : "default" }}
+              style={{ cursor: avatarBusy ? "wait" : isEditing ? "pointer" : "default" }}
               onClick={() => {
-                if (isEditing) {
+                if (isEditing && !avatarBusy) {
                   fileRef.current?.click();
                 }
               }}
@@ -2029,7 +2241,7 @@ function CharArchiveView({
               {isEditing && (
                 <div className="absolute inset-0 bg-black/30 flex flex-col items-center justify-center pointer-events-none text-white">
                   <IconCamera size={24} />
-                  <span className="ts-10 mt-1">Change Photo</span>
+                  <span className="ts-10 mt-1">{avatarBusy ? "Optimizing..." : "Change Photo"}</span>
                 </div>
               )}
             </div>
@@ -2039,6 +2251,7 @@ function CharArchiveView({
               type="file"
               accept="image/*"
               className="hidden"
+              disabled={avatarBusy}
               onChange={async (e) => {
                 const file = e.target.files?.[0];
                 if (file) await handleAvatarFile(file);
@@ -2165,6 +2378,83 @@ function CharArchiveView({
           </div>
         </div>
 
+        {isEditing && (
+          <div className="char-wall-settings">
+            <div className="char-wall-settings-options">
+              <div>
+                <div className="char-wall-settings-label">PHOTO WALL RATIO</div>
+                <div className="char-wall-settings-row">
+                  {POLAROID_RATIOS.map((ratio, index) => (
+                    <button
+                      key={ratio.label}
+                      type="button"
+                      className={`char-wall-option ${polaroidStyle === index ? "is-active" : ""}`}
+                      onClick={() => setPolaroidStyle(index)}
+                    >
+                      {ratio.label}
+                    </button>
+                  ))}
+                </div>
+              </div>
+              <div>
+                <div className="char-wall-settings-label">CARD SIZE</div>
+                <div className="char-wall-settings-row">
+                  {([
+                    ["random", "随机"],
+                    ["small", "小"],
+                    ["medium", "中"],
+                    ["large", "大"],
+                  ] as const).map(([value, label]) => (
+                    <button
+                      key={value}
+                      type="button"
+                      className={`char-wall-option ${polaroidSize === value ? "is-active" : ""}`}
+                      onClick={() => setPolaroidSize(value)}
+                    >
+                      {label}
+                    </button>
+                  ))}
+                </div>
+              </div>
+            </div>
+            <div
+              ref={previewRef}
+              className={`char-wall-preview ${POLAROID_RATIOS[polaroidStyle % POLAROID_RATIOS.length].className}`}
+              onPointerDown={handlePreviewPointerDown}
+              onPointerMove={handlePreviewPointerMove}
+              onPointerUp={handlePreviewPointerUp}
+              onPointerCancel={handlePreviewPointerUp}
+              aria-label="照片墙头像取景预览，可拖动或双指缩放"
+            >
+              {avatar ? (
+                <img
+                  ref={previewImageRef}
+                  key={`${char.id}-${avatar}-${polaroidStyle}`}
+                  src={avatar}
+                  alt="照片墙头像预览"
+                  draggable={false}
+                  onLoad={(event) => {
+                    setPreviewImageNaturalSize({
+                      width: event.currentTarget.naturalWidth,
+                      height: event.currentTarget.naturalHeight,
+                    });
+                  }}
+                  style={{
+                    position: "static",
+                    width: "100%",
+                    height: "100%",
+                    objectFit: "cover",
+                    objectPosition: `${100 - polaroidImageX}% ${100 - polaroidImageY}%`,
+                    transform: `scale(${polaroidImageZoom})`,
+                  }}
+                />
+              ) : (
+                <CharAvatarFallback name={name || char.name} size="100%" />
+              )}
+            </div>
+          </div>
+        )}
+
         {/* Persona Section (Full Width) */}
         <div className="char-archive-text-section border-b-0">
           <div className="char-log-entry mb-4">
@@ -2255,9 +2545,19 @@ function CharArchiveView({
         <div className="char-archive-actions">
           {!dummy && confirmDelete ? (
             <div className="char-confirm-row">
-              <span className="char-confirm-text">CONFIRM DELETE?</span>
-              <button className="char-confirm-yes" onClick={onDelete}>YES</button>
-              <button className="char-confirm-no" onClick={() => setConfirmDelete(false)}>NO</button>
+              <span className="char-confirm-text">DELETE CHARACTER + PRIVATE CHAT?</span>
+              <button className="char-confirm-yes" disabled={deleteBusy} onClick={async () => {
+                if (deleteBusy) return;
+                setDeleteBusy(true);
+                try {
+                  await onDelete();
+                } catch (error) {
+                  console.error("[Character] delete failed:", error);
+                  setDeleteBusy(false);
+                  onNotice?.("删除失败，请重试");
+                }
+              }}>{deleteBusy ? "..." : "YES"}</button>
+              <button className="char-confirm-no" disabled={deleteBusy} onClick={() => setConfirmDelete(false)}>NO</button>
             </div>
           ) : (
             !dummy && isEditing ? (
@@ -2396,7 +2696,10 @@ function CharArchiveView({
                           type="button"
                           className="flex-1 rounded-lg bg-[var(--c-text)] px-3 py-2 ts-12 font-semibold text-[var(--c-page-body-bg)] disabled:opacity-40"
                           disabled={getCharacterCurrentVersion(char.id) === version.version}
-                          onClick={() => setRestoreTarget(version)}
+                          onClick={() => {
+                            setShowVersions(false);
+                            setRestoreTarget(version);
+                          }}
                         >
                           切换到 V{version.version}
                         </button>
@@ -2608,40 +2911,88 @@ function AutoResizingTextarea({
 
 // ── 工具函数 ─────────────────────────────────────────
 
-function fileToDataUrl(file: File): Promise<string> {
+type ImageCompressionAttempt = { maxSize: number; quality: number };
+
+function readFileAsDataUrl(file: File): Promise<string> {
   return new Promise((resolve, reject) => {
     const reader = new FileReader();
-    reader.onload = () => {
-      const img = new Image();
-      img.onload = () => {
-        const MAX_SIZE = 400;
-        let w = img.width;
-        let h = img.height;
-        if (w > MAX_SIZE || h > MAX_SIZE) {
-          if (w > h) {
-            h = Math.round(h * MAX_SIZE / w);
-            w = MAX_SIZE;
-          } else {
-            w = Math.round(w * MAX_SIZE / h);
-            h = MAX_SIZE;
-          }
-        }
-        const canvas = document.createElement("canvas");
-        canvas.width = w;
-        canvas.height = h;
-        const ctx = canvas.getContext("2d");
-        if (!ctx) return resolve(reader.result as string);
-        ctx.drawImage(img, 0, 0, w, h);
-
-        // Use webp or jpeg to heavily compress large png files before saving to localstorage
-        resolve(canvas.toDataURL("image/webp", 0.8));
-      };
-      img.onerror = () => resolve(reader.result as string); // fallback to raw
-      img.src = reader.result as string;
-    };
-    reader.onerror = reject;
+    reader.onload = () => resolve(String(reader.result || ""));
+    reader.onerror = () => reject(reader.error || new Error("读取图片失败"));
     reader.readAsDataURL(file);
   });
+}
+
+function loadDataUrlImage(dataUrl: string): Promise<HTMLImageElement> {
+  return new Promise((resolve, reject) => {
+    const img = new Image();
+    img.onload = () => resolve(img);
+    img.onerror = () => reject(new Error("无法解析图片，请更换图片"));
+    img.src = dataUrl;
+  });
+}
+
+function canvasToBlob(canvas: HTMLCanvasElement, quality: number): Promise<Blob> {
+  return new Promise((resolve, reject) => {
+    canvas.toBlob(
+      blob => blob ? resolve(blob) : reject(new Error("图片编码失败，请更换图片")),
+      "image/webp",
+      quality,
+    );
+  });
+}
+
+function blobToDataUrl(blob: Blob): Promise<string> {
+  return new Promise((resolve, reject) => {
+    const reader = new FileReader();
+    reader.onload = () => resolve(String(reader.result || ""));
+    reader.onerror = () => reject(reader.error || new Error("读取压缩图片失败"));
+    reader.readAsDataURL(blob);
+  });
+}
+
+async function fileToDataUrl(
+  file: File,
+  options: {
+    maxSize?: number;
+    quality?: number;
+    maxBytes?: number;
+    fallbacks?: readonly ImageCompressionAttempt[];
+  } = {},
+): Promise<string> {
+  const sourceDataUrl = await readFileAsDataUrl(file);
+  const maxSize = options.maxSize ?? 400;
+  const quality = options.quality ?? 0.8;
+
+  try {
+    const img = await loadDataUrlImage(sourceDataUrl);
+    const attempts: ImageCompressionAttempt[] = [
+      { maxSize, quality },
+      ...(options.fallbacks ?? []),
+    ];
+    const canvas = document.createElement("canvas");
+
+    for (const attempt of attempts) {
+      const scale = Math.min(1, attempt.maxSize / Math.max(img.width, img.height));
+      const width = Math.max(1, Math.round(img.width * scale));
+      const height = Math.max(1, Math.round(img.height * scale));
+      canvas.width = width;
+      canvas.height = height;
+      const ctx = canvas.getContext("2d");
+      if (!ctx) throw new Error("当前浏览器无法处理图片，请更换图片");
+      ctx.drawImage(img, 0, 0, width, height);
+
+      const blob = await canvasToBlob(canvas, attempt.quality);
+      if (!options.maxBytes || blob.size <= options.maxBytes) {
+        return await blobToDataUrl(blob);
+      }
+    }
+
+    throw new Error(`图片压缩后仍超过 ${Math.ceil((options.maxBytes ?? 0) / 1024)}KB，请更换图片`);
+  } catch (error) {
+    // 旧调用未要求体积上限时维持原有兼容兜底；角色头像的受限链路绝不保存原始大图。
+    if (!options.maxBytes) return sourceDataUrl;
+    throw error;
+  }
 }
 
 // ── 图标 ─────────────────────────────────────────────

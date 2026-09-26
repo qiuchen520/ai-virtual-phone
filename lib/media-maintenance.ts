@@ -5,7 +5,7 @@ import { updateChatMessage, type ChatMessage } from "./chat-storage";
 import { DATA_MODULES } from "./data-management/modules";
 import { estimateValueBytes } from "./data-management/serializers";
 import { openIndexedDbAtLeast } from "./idb-open";
-import { kvEntries, kvGet, kvSet, registerKvMigration } from "./kv-db";
+import { hydrateKvDb, isKvHydrated, kvEntries, kvGet, kvSet, registerKvMigration } from "./kv-db";
 import { deleteMediaRef, isMediaStoreRef, loadMediaBlob, storeMediaBlob } from "./media-cache-storage";
 import { getAudioBlob, deleteTrack, loadAllTracks } from "./music-storage";
 import { momentsDb } from "./moments-db";
@@ -449,22 +449,32 @@ async function runXiaohongshuImageMaintenance(result: MediaMaintenanceResult, no
   let changed = false;
 
   for (const note of state.notes) {
-    if (!note.imageAssetId) continue;
+    // 多图帖子把全部图片一起清理/压缩；旧单图帖子只有 imageAssetId
+    const assetIds = note.imageAssetIds?.length
+      ? note.imageAssetIds
+      : (note.imageAssetId ? [note.imageAssetId] : []);
+    if (assetIds.length === 0) continue;
     if (isOlderThan(note.createdAt, CLEAN_AFTER_MS, nowMs)) {
       state = updateXiaohongshuStateNotes(state, item =>
-        item.id === note.id ? { ...item, imageAssetId: undefined, imageCleanedAt: nowIso, updatedAt: nowIso } : item
+        item.id === note.id
+          ? { ...item, imageAssetId: undefined, imageAssetIds: undefined, imageCleanedAt: nowIso, updatedAt: nowIso }
+          : item
       );
       result.xiaohongshuImagesCleaned += 1;
       changed = true;
       continue;
     }
     if (note.imageCompressedAt || !isOlderThan(note.createdAt, COMPRESS_AFTER_MS, nowMs)) continue;
-    const compressed = await compressThemeAssetById(note.imageAssetId).catch(() => ({ changed: false, freedBytes: 0 }));
+    let anyCompressed = false;
+    for (const assetId of assetIds) {
+      const compressed = await compressThemeAssetById(assetId).catch(() => ({ changed: false, freedBytes: 0 }));
+      result.freedBytes += compressed.freedBytes;
+      if (compressed.changed) anyCompressed = true;
+    }
     state = updateXiaohongshuStateNotes(state, item =>
       item.id === note.id ? { ...item, imageCompressedAt: nowIso, updatedAt: nowIso } : item
     );
-    result.freedBytes += compressed.freedBytes;
-    if (compressed.changed) result.xiaohongshuImagesCompressed += 1;
+    if (anyCompressed) result.xiaohongshuImagesCompressed += 1;
     changed = true;
   }
 
@@ -695,9 +705,24 @@ async function collectReferencedThemeAssetIds(knownIds: Set<string>): Promise<Se
 
 export async function cleanupOrphanThemeAssets(): Promise<OrphanThemeCleanupResult> {
   if (!hasBrowserApi()) return { deletedAssets: 0, freedBytes: 0 };
+
+  // 孤儿判定的安全性完全依赖"扫到了所有引用"。表情包/壁纸/字体等的引用都记在
+  // kv 里，而 kvEntries() 读的是内存缓存——自动维护在启动 45 秒后就会跑，慢设备
+  // 上 kv 可能还没水合完，此时扫描是空的，全部素材都会被误判成孤儿一波删光
+  // （用户实报：133 个表情包名字都在、图全没了）。未水合宁可跳过本次清理。
+  await hydrateKvDb().catch(() => {});
+  if (!isKvHydrated()) return { deletedAssets: 0, freedBytes: 0 };
+
   const summaries = await listThemeAssetSummaries();
+  if (summaries.length === 0) return { deletedAssets: 0, freedBytes: 0 };
   const knownIds = new Set(summaries.map(summary => summary.id));
   const referenced = await collectReferencedThemeAssetIds(knownIds);
+
+  // 理智检查：素材库非空但一条引用都没扫到，几乎必然是扫描侧出了问题
+  // （存储读取异常、缓存为空等），而不是用户真把所有主题内容都删了。
+  // 误删不可恢复，这种情况放弃本次清理。
+  if (referenced.size === 0) return { deletedAssets: 0, freedBytes: 0 };
+
   let deletedAssets = 0;
   let freedBytes = 0;
 
